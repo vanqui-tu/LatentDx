@@ -1,6 +1,6 @@
-# MedLatent
+# LatentDx
 
-MedLatent is an artifact implementation of **compact latent KV communication for cross-hospital rare-disease diagnosis**.
+LatentDx is an artifact implementation of **compact latent KV communication for cross-hospital rare-disease diagnosis**.
 
 The repository is intentionally focused on the paper's main method. It does not include text-sharing baselines, external multi-agent baselines, model checkpoints, latent caches, or experiment logs.
 
@@ -10,8 +10,8 @@ MedLatent has two method variants:
 
 | Paper name | Code name | Purpose |
 |---|---|---|
-| MedLatent-H | `LatentDistiller` | Same-backbone latent KV distillation. Each hospital compresses its private retrieved prompt into a fixed-length latent KV block. |
-| MedLatent-X | `LatentProjector` | Cross-family latent alignment. Foreign-family latent blocks are projected into the host-family embedding space. |
+| LatentDx-H | `LatentDistiller` | Same-backbone latent KV distillation. Each hospital compresses its private retrieved prompt into a fixed-length latent KV block. |
+| LatentDx-X | `LatentProjector` | Cross-family latent alignment. Foreign-family latent blocks are projected into the host-family embedding space. |
 
 All LLM backbones are frozen. The trainable components are limited to:
 
@@ -267,9 +267,9 @@ Each evaluation writes a JSONL prediction file and a sibling `.metrics.json` fil
 
 The following real paths were smoke-tested on a local HuggingFace CausalLM checkpoint and OMIM-style JSON/hospital shards:
 
-- MedLatent-H training: 1 step forward/backward/checkpoint save.
-- MedLatent-X cache build: encoder latent cache construction from a trained distiller.
-- MedLatent-X training: 1 step projector training and checkpoint save.
+- LatentDx-H training: 1 step forward/backward/checkpoint save.
+- LatentDx-X cache build: encoder latent cache construction from a trained distiller.
+- LatentDx-X training: 1 step projector training and checkpoint save.
 - Diagnosis inference: greedy generation for both MedLatent-H and MedLatent-X.
 
 The smoke uses a tiny model and `num_latents=2` only to validate execution. Paper reproduction should use the defaults in the next section.
