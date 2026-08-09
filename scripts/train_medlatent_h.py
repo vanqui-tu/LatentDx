@@ -19,7 +19,7 @@ def main() -> None:
     add_common_args(parser)
     parser.add_argument("--toy", action="store_true", help="Run a small CPU toy training job for smoke testing.")
     parser.add_argument("--output_dir", default="artifacts/toy_medlatent_h")
-    parser.add_argument("--steps", type=int, default=16)
+    parser.add_argument("--steps", type=int, default=0, help="Optional optimizer-update cap; 0 runs the configured epochs.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model_name", default="", help="HF model name/path for real MedLatent-H training.")
     parser.add_argument("--train_file", default="", help="Training JSON file.")
@@ -29,7 +29,12 @@ def main() -> None:
     parser.add_argument("--max_prompt_length", type=int, default=320)
     parser.add_argument("--max_target_length", type=int, default=64)
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--effective_batch_size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--val_file", default="", help="Validation JSON file for checkpoint selection.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     parser.add_argument("--local_files_only", action="store_true")
@@ -47,6 +52,7 @@ def main() -> None:
         summary = train_medlatent_h_real(
             model_name=args.model_name,
             train_file=args.train_file,
+            val_file=args.val_file or None,
             hospital_dir=args.hospital_dir,
             output_dir=args.output_dir,
             num_hospitals=args.num_hospitals,
@@ -54,8 +60,12 @@ def main() -> None:
             max_prompt_length=args.max_prompt_length,
             max_target_length=args.max_target_length,
             batch_size=args.batch_size,
+            effective_batch_size=args.effective_batch_size,
+            epochs=args.epochs,
+            warmup_steps=args.warmup_steps,
             max_steps=args.steps,
             learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
             seed=args.seed,
             device=args.device,
         dtype=args.dtype,

@@ -153,6 +153,7 @@ def train_medlatent_h_real(
     *,
     model_name: str,
     train_file: str,
+    val_file: str | None = None,
     hospital_dir: str,
     output_dir: str,
     num_hospitals: int = 3,
@@ -160,8 +161,12 @@ def train_medlatent_h_real(
     max_prompt_length: int = 320,
     max_target_length: int = 64,
     batch_size: int = 1,
-    max_steps: int = 1,
+    effective_batch_size: int = 8,
+    epochs: int = 5,
+    warmup_steps: int = 100,
     learning_rate: float = 1e-4,
+    weight_decay: float = 0.01,
+    max_steps: int = 0,
     seed: int = 42,
     device: str = "cuda",
     dtype: str = "bfloat16",
@@ -188,51 +193,144 @@ def train_medlatent_h_real(
     hidden_size = int(model.config.hidden_size)
     distiller = LatentDistiller(hidden_size).to(device=resolved_device, dtype=torch_dtype)
     boundary = BoundaryEmbeddings(hidden_size).to(device=resolved_device, dtype=torch_dtype)
-    optimizer = torch.optim.AdamW(list(distiller.parameters()) + list(boundary.parameters()), lr=learning_rate, weight_decay=0.01)
-    dataset = MedLatentDiagnosisDataset(
+    train_dataset = MedLatentDiagnosisDataset(
         data_file=train_file,
         hospital_dir=hospital_dir,
         tokenizer=tokenizer,
         num_hospitals=num_hospitals,
         max_prompt_length=max_prompt_length,
         max_target_length=max_target_length,
-        limit=max(batch_size * max_steps, batch_size),
+        limit=-1,
         hpo_embeddings_file=hpo_embeddings_file,
         hpo_ic_file=hpo_ic_file,
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
+    val_dataset = MedLatentDiagnosisDataset(
+        data_file=val_file or train_file,
+        hospital_dir=hospital_dir,
+        tokenizer=tokenizer,
+        num_hospitals=num_hospitals,
+        max_prompt_length=max_prompt_length,
+        max_target_length=max_target_length,
+        limit=-1 if val_file else min(len(train_dataset), 128),
+        hpo_embeddings_file=hpo_embeddings_file,
+        hpo_ic_file=hpo_ic_file,
+    )
+    optimizer = torch.optim.AdamW(
+        list(distiller.parameters()) + list(boundary.parameters()),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+    micro_batch_size = max(1, int(batch_size))
+    accumulation = max(1, int(effective_batch_size) // micro_batch_size)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=micro_batch_size,
         shuffle=False,
         collate_fn=lambda rows: collate_medlatent(rows, pad_token_id=tokenizer.pad_token_id),
     )
+    updates_per_epoch = (len(train_loader) + accumulation - 1) // accumulation
+    total_updates = updates_per_epoch * max(1, int(epochs))
 
+    def lr_multiplier(step: int) -> float:
+        if warmup_steps <= 0:
+            return 1.0
+        return min(1.0, float(step + 1) / float(warmup_steps))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_multiplier)
     hospital_order = list(range(num_hospitals))
+    best_val = float("inf")
+    global_update = 0
     last_stats: dict[str, float] = {}
-    step = 0
-    for batch in loader:
-        step += 1
-        loss, stats = forward_medlatent_h_batch(
-            model=model,
-            distiller=distiller,
-            boundary=boundary,
-            batch=batch,
-            num_latents=num_latents,
-            hospital_order=hospital_order,
-            device=resolved_device,
+
+    def validation_loss() -> float:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=lambda rows: collate_medlatent(rows, pad_token_id=tokenizer.pad_token_id),
         )
+        total = 0.0
+        count = 0
+        distiller.eval()
+        boundary.eval()
+        with torch.no_grad():
+            for val_batch in val_loader:
+                loss, _ = forward_medlatent_h_batch(
+                    model=model,
+                    distiller=distiller,
+                    boundary=boundary,
+                    batch=val_batch,
+                    num_latents=num_latents,
+                    hospital_order=hospital_order,
+                    device=resolved_device,
+                )
+                total += float(loss.detach().cpu())
+                count += 1
+        return total / max(1, count)
+
+    train_generator = torch.Generator().manual_seed(seed)
+    for epoch in range(max(1, int(epochs))):
+        distiller.train()
+        boundary.train()
+        indices = torch.randperm(len(train_dataset), generator=train_generator).tolist()
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(distiller.parameters()) + list(boundary.parameters()), 1.0)
-        optimizer.step()
-        last_stats = stats
-        print(json.dumps({"event": "train_step", "step": step, **stats}))
-        if max_steps > 0 and step >= max_steps:
+        update_loss = 0.0
+        update_count = 0
+        for index in indices:
+            batch = collate_medlatent([train_dataset[index]], pad_token_id=tokenizer.pad_token_id)
+            loss, stats = forward_medlatent_h_batch(
+                model=model,
+                distiller=distiller,
+                boundary=boundary,
+                batch=batch,
+                num_latents=num_latents,
+                hospital_order=hospital_order,
+                device=resolved_device,
+            )
+            loss.backward()
+            update_loss += float(loss.detach().cpu())
+            update_count += 1
+            is_last = index == indices[-1]
+            if update_count >= accumulation or is_last:
+                divisor = update_count
+                for parameter in list(distiller.parameters()) + list(boundary.parameters()):
+                    if parameter.grad is not None:
+                        parameter.grad.div_(divisor)
+                torch.nn.utils.clip_grad_norm_(list(distiller.parameters()) + list(boundary.parameters()), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_update += 1
+                last_stats = {**stats, "train_ce": update_loss / divisor, "learning_rate": scheduler.get_last_lr()[0]}
+                print(json.dumps({"event": "train_update", "epoch": epoch + 1, "update": global_update, **last_stats}))
+                update_loss = 0.0
+                update_count = 0
+                if max_steps > 0 and global_update >= max_steps:
+                    break
+        current_val = validation_loss()
+        print(json.dumps({"event": "validation", "epoch": epoch + 1, "val_ce": current_val}))
+        if current_val < best_val:
+            best_val = current_val
+            output = Path(output_dir)
+            output.mkdir(parents=True, exist_ok=True)
+            distiller.save(output / "distiller_final.pt")
+            boundary.save(output / "boundary_final.pt")
+        if max_steps > 0 and global_update >= max_steps:
             break
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    distiller.save(output / "distiller_final.pt")
-    boundary.save(output / "boundary_final.pt")
-    (output / "training_summary.json").write_text(json.dumps({"steps": step, **last_stats}, indent=2))
-    return {"steps": float(step), **last_stats}
+    if not (output / "distiller_final.pt").exists():
+        distiller.save(output / "distiller_final.pt")
+        boundary.save(output / "boundary_final.pt")
+    (output / "training_summary.json").write_text(json.dumps({
+        "epochs": epoch + 1,
+        "updates": global_update,
+        "best_val_ce": best_val,
+        "effective_batch_size": effective_batch_size,
+        "micro_batch_size": micro_batch_size,
+        **last_stats,
+    }, indent=2))
+    return {"steps": float(global_update), "best_val_ce": float(best_val), **last_stats}
+
+
