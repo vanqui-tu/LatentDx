@@ -38,17 +38,48 @@ def _append_embedding(model, embedding: torch.Tensor, prefix_mask: torch.Tensor,
 
 def _legacy_cache(past_key_values):
     if hasattr(past_key_values, "to_legacy_cache"):
-        return past_key_values.to_legacy_cache()
+        try:
+            return past_key_values.to_legacy_cache()
+        except TypeError:
+            pass
     return past_key_values
 
 
+def _iter_key_value_pairs(past_key_values):
+    cache = _legacy_cache(past_key_values)
+    if isinstance(cache, (tuple, list)) and len(cache) == 2 and all(isinstance(item, torch.Tensor) for item in cache):
+        yield cache[0], cache[1]
+        return
+
+    for layer in cache:
+        if isinstance(layer, dict):
+            key = layer.get("key")
+            value = layer.get("value")
+            if key is None:
+                key = layer.get("key_cache")
+            if value is None:
+                value = layer.get("value_cache")
+            if key is None or value is None:
+                raise ValueError("Unsupported cache layer format")
+        elif isinstance(layer, (tuple, list)):
+            if len(layer) < 2:
+                raise ValueError("Each cache layer must contain key and value tensors")
+            key, value, *_ = layer
+        else:
+            raise TypeError(f"Unsupported cache layer type: {type(layer)}")
+        yield key, value
+
+
 def _slice_last_positions(past_key_values, num_positions: int):
-    return tuple((k[:, :, -num_positions:, :], v[:, :, -num_positions:, :]) for k, v in _legacy_cache(past_key_values))
+    return tuple(
+        (k[:, :, -num_positions:, :], v[:, :, -num_positions:, :])
+        for k, v in _iter_key_value_pairs(past_key_values)
+    )
 
 
 def _to_dynamic_cache(legacy_cache):
     cache = DynamicCache()
-    for layer_idx, (key, value) in enumerate(legacy_cache):
+    for layer_idx, (key, value) in enumerate(_iter_key_value_pairs(legacy_cache)):
         cache.update(key, value, layer_idx)
     return cache
 
