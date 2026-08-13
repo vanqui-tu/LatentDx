@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
@@ -106,46 +107,65 @@ def forward_medlatent_h_batch(
     hospital_order: list[int],
     device: torch.device,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    hospital_blocks: dict[int, tuple] = {}
-    block_len = int(num_latents) + 2
-    for hospital_id in hospital_order:
-        input_ids = batch["hospital_ids_all"][hospital_id].to(device)
-        attention_mask = batch["hospital_mask_all"][hospital_id].to(device)
-        with torch.no_grad():
-            prompt_out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=True,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-        past_key_values = prompt_out.past_key_values
-        lengths = attention_mask.sum(dim=1) - 1
-        hidden = prompt_out.hidden_states[-1][torch.arange(input_ids.shape[0], device=device), lengths, :]
-        prefix_mask = attention_mask
+    # Hospital prompts are independent until their compact blocks are
+    # concatenated at the host. Run them as one [hospitals * queries] batch to
+    # avoid launching a separate prefill and latent loop for every hospital.
+    hospital_inputs = [batch["hospital_ids_all"][hospital_id].to(device) for hospital_id in hospital_order]
+    hospital_masks = [batch["hospital_mask_all"][hospital_id].to(device) for hospital_id in hospital_order]
+    prompt_width = max(input_ids.shape[1] for input_ids in hospital_inputs)
+    input_ids = torch.cat(
+        [F.pad(ids, (0, prompt_width - ids.shape[1]), value=0) for ids in hospital_inputs], dim=0
+    )
+    attention_mask = torch.cat(
+        [F.pad(mask, (0, prompt_width - mask.shape[1]), value=0) for mask in hospital_masks], dim=0
+    )
+    query_batch_size = input_ids.shape[0] // len(hospital_order)
 
-        past_key_values, prefix_mask = _append_embedding(model, boundary.begin, prefix_mask, past_key_values)
-        for step in range(int(num_latents)):
-            if step == 0:
-                step_input = distiller.begin_embedding(dtype=model.get_input_embeddings().weight.dtype, device=device)
-                step_input = step_input.expand(input_ids.shape[0], 1, -1)
-            else:
-                step_input = distiller(hidden).unsqueeze(1)
-            attention = torch.cat([prefix_mask, prefix_mask.new_ones((input_ids.shape[0], 1))], dim=1)
-            latent_out = model(
-                inputs_embeds=step_input,
-                attention_mask=attention,
-                position_ids=_build_position_ids(prefix_mask, 1),
-                past_key_values=past_key_values,
-                use_cache=True,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            past_key_values = latent_out.past_key_values
-            hidden = latent_out.hidden_states[-1][:, -1, :]
-            prefix_mask = attention
-        past_key_values, prefix_mask = _append_embedding(model, boundary.end, prefix_mask, past_key_values)
-        hospital_blocks[hospital_id] = _slice_last_positions(past_key_values, block_len)
+    block_len = int(num_latents) + 2
+    with torch.no_grad():
+        prompt_out = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+    past_key_values = prompt_out.past_key_values
+    lengths = attention_mask.sum(dim=1) - 1
+    hidden = prompt_out.hidden_states[-1][torch.arange(input_ids.shape[0], device=device), lengths, :]
+    prefix_mask = attention_mask
+
+    past_key_values, prefix_mask = _append_embedding(model, boundary.begin, prefix_mask, past_key_values)
+    for step in range(int(num_latents)):
+        if step == 0:
+            step_input = distiller.begin_embedding(dtype=model.get_input_embeddings().weight.dtype, device=device)
+            step_input = step_input.expand(input_ids.shape[0], 1, -1)
+        else:
+            step_input = distiller(hidden).unsqueeze(1)
+        attention = torch.cat([prefix_mask, prefix_mask.new_ones((input_ids.shape[0], 1))], dim=1)
+        latent_out = model(
+            inputs_embeds=step_input,
+            attention_mask=attention,
+            position_ids=_build_position_ids(prefix_mask, 1),
+            past_key_values=past_key_values,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        past_key_values = latent_out.past_key_values
+        hidden = latent_out.hidden_states[-1][:, -1, :]
+        prefix_mask = attention
+    past_key_values, _ = _append_embedding(model, boundary.end, prefix_mask, past_key_values)
+
+    compact_blocks = _slice_last_positions(past_key_values, block_len)
+    hospital_blocks = {
+        hospital_id: tuple(
+            (key[hospital_index * query_batch_size : (hospital_index + 1) * query_batch_size],
+             value[hospital_index * query_batch_size : (hospital_index + 1) * query_batch_size])
+            for key, value in compact_blocks
+        )
+        for hospital_index, hospital_id in enumerate(hospital_order)
+    }
 
     legacy_cache, latent_mask = _assemble_blocks(hospital_blocks, hospital_order)
     host_ids = batch["host_question_ids"].to(device)
