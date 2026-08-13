@@ -182,7 +182,8 @@ def forward_medlatent_h_batch(
 
     target_ids = batch["target_ids"].to(device)
     target_labels = batch["target_labels"].to(device)
-    target_attention = torch.cat([latent_mask.to(device), host_mask, torch.ones_like(target_ids)], dim=1)
+    target_mask = (target_labels != IGNORE_INDEX).long()
+    target_attention = torch.cat([latent_mask.to(device), host_mask, target_mask], dim=1)
     host_prefix = torch.cat([latent_mask.to(device), host_mask], dim=1)
     target_out = model(
         input_ids=target_ids,
@@ -192,8 +193,12 @@ def forward_medlatent_h_batch(
         use_cache=False,
         return_dict=True,
     )
-    loss = diagnosis_cross_entropy(host_out.logits[:, -1, :], target_out.logits, target_labels, ignore_index=IGNORE_INDEX)
-    first_pred = host_out.logits[:, -1, :].argmax(dim=-1)
+    host_last_positions = latent_mask.shape[1] + host_mask.sum(dim=1) - 1
+    first_logits = host_out.logits[
+        torch.arange(host_out.logits.shape[0], device=device), host_last_positions
+    ]
+    loss = diagnosis_cross_entropy(first_logits, target_out.logits, target_labels, ignore_index=IGNORE_INDEX)
+    first_pred = first_logits.argmax(dim=-1)
     first_gold = target_labels[:, 0]
     first_mask = first_gold != IGNORE_INDEX
     first_acc = (first_pred[first_mask] == first_gold[first_mask]).float().mean().item() if first_mask.any() else 0.0
@@ -272,15 +277,11 @@ def train_medlatent_h_real(
         weight_decay=weight_decay,
     )
     micro_batch_size = max(1, int(batch_size))
-    accumulation = max(1, int(effective_batch_size) // micro_batch_size)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=micro_batch_size,
-        shuffle=False,
-        collate_fn=lambda rows: collate_medlatent(rows, pad_token_id=tokenizer.pad_token_id),
-    )
-    updates_per_epoch = (len(train_loader) + accumulation - 1) // accumulation
-    total_updates = updates_per_epoch * max(1, int(epochs))
+    if effective_batch_size < micro_batch_size:
+        raise ValueError("effective_batch_size must be at least batch_size")
+    if effective_batch_size % micro_batch_size:
+        raise ValueError("effective_batch_size must be divisible by batch_size")
+    updates_per_epoch = (len(train_dataset) + effective_batch_size - 1) // effective_batch_size
 
     def lr_multiplier(step: int) -> float:
         if warmup_steps <= 0:
@@ -294,18 +295,14 @@ def train_medlatent_h_real(
     last_stats: dict[str, float] = {}
 
     def validation_loss() -> float:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=1,
-            shuffle=False,
-            collate_fn=lambda rows: collate_medlatent(rows, pad_token_id=tokenizer.pad_token_id),
-        )
         total = 0.0
         count = 0
         distiller.eval()
         boundary.eval()
         with torch.no_grad():
-            for val_batch in val_loader:
+            for start in range(0, len(val_dataset), micro_batch_size):
+                rows = [val_dataset[index] for index in range(start, min(start + micro_batch_size, len(val_dataset)))]
+                val_batch = collate_medlatent(rows, pad_token_id=tokenizer.pad_token_id)
                 loss, _ = forward_medlatent_h_batch(
                     model=model,
                     distiller=distiller,
@@ -315,8 +312,8 @@ def train_medlatent_h_real(
                     hospital_order=hospital_order,
                     device=resolved_device,
                 )
-                total += float(loss.detach().cpu())
-                count += 1
+                total += float(loss.detach().cpu()) * len(rows)
+                count += len(rows)
         return total / max(1, count)
 
     train_generator = torch.Generator().manual_seed(seed)
@@ -326,9 +323,11 @@ def train_medlatent_h_real(
         indices = torch.randperm(len(train_dataset), generator=train_generator).tolist()
         optimizer.zero_grad(set_to_none=True)
         update_loss = 0.0
-        update_count = 0
-        for index in indices:
-            batch = collate_medlatent([train_dataset[index]], pad_token_id=tokenizer.pad_token_id)
+        update_examples = 0
+        for start in range(0, len(indices), micro_batch_size):
+            batch_indices = indices[start : start + micro_batch_size]
+            rows = [train_dataset[index] for index in batch_indices]
+            batch = collate_medlatent(rows, pad_token_id=tokenizer.pad_token_id)
             loss, stats = forward_medlatent_h_batch(
                 model=model,
                 distiller=distiller,
@@ -338,12 +337,13 @@ def train_medlatent_h_real(
                 hospital_order=hospital_order,
                 device=resolved_device,
             )
-            loss.backward()
-            update_loss += float(loss.detach().cpu())
-            update_count += 1
-            is_last = index == indices[-1]
-            if update_count >= accumulation or is_last:
-                divisor = update_count
+            batch_examples = len(rows)
+            (loss * batch_examples).backward()
+            update_loss += float(loss.detach().cpu()) * batch_examples
+            update_examples += batch_examples
+            is_last = start + micro_batch_size >= len(indices)
+            if update_examples >= effective_batch_size or is_last:
+                divisor = update_examples
                 for parameter in list(distiller.parameters()) + list(boundary.parameters()):
                     if parameter.grad is not None:
                         parameter.grad.div_(divisor)
@@ -355,7 +355,7 @@ def train_medlatent_h_real(
                 last_stats = {**stats, "train_ce": update_loss / divisor, "learning_rate": scheduler.get_last_lr()[0]}
                 print(json.dumps({"event": "train_update", "epoch": epoch + 1, "update": global_update, **last_stats}))
                 update_loss = 0.0
-                update_count = 0
+                update_examples = 0
                 if max_steps > 0 and global_update >= max_steps:
                     break
         current_val = validation_loss()
