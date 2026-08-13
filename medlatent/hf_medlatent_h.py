@@ -175,7 +175,9 @@ def forward_medlatent_h_batch(
         use_cache=False,
         return_dict=True,
     )
-    host_last_positions = latent_mask.shape[1] + host_mask.sum(dim=1) - 1
+    # Logits are returned only for host_ids; latent blocks live in the cache
+    # prefix and must not be included in this sequence index.
+    host_last_positions = host_mask.sum(dim=1) - 1
     first_logits = host_out.logits[
         torch.arange(host_out.logits.shape[0], device=device), host_last_positions
     ]
