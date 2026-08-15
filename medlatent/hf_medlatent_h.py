@@ -24,7 +24,7 @@ def _build_position_ids(prefix_mask: torch.Tensor, current_len: int) -> torch.Te
 
 def _decoder_forward(model, **kwargs):
     """Run the decoder without the vocabulary projection used only for loss/generation."""
-    return model.get_base_model()(**kwargs)
+    return model.base_model(**kwargs)
 
 
 def _append_embedding(model, embedding: torch.Tensor, prefix_mask: torch.Tensor, past_key_values):
