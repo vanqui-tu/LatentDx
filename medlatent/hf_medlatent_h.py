@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 from pathlib import Path
 
 import torch
@@ -220,11 +221,20 @@ def train_medlatent_h_real(
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, local_files_only=local_files_only)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    if importlib.util.find_spec("flash_attn") is None:
+        raise RuntimeError(
+            "MedLatent-H training requires FlashAttention 2. "
+            "Install flash-attn in the training environment, then retry."
+        )
+    model_kwargs = {
+        "trust_remote_code": True,
+        "local_files_only": local_files_only,
+        "torch_dtype": torch_dtype,
+        "attn_implementation": "flash_attention_2",
+    }
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        trust_remote_code=True,
-        local_files_only=local_files_only,
-        torch_dtype=torch_dtype,
+        **model_kwargs,
     ).to(resolved_device)
     model.eval()
     for param in model.parameters():

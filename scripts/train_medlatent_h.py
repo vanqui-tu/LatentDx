@@ -68,11 +68,11 @@ def main() -> None:
             weight_decay=args.weight_decay,
             seed=args.seed,
             device=args.device,
-        dtype=args.dtype,
-        local_files_only=args.local_files_only,
-        hpo_embeddings_file=args.hpo_embeddings_file or None,
-        hpo_ic_file=args.hpo_ic_file or None,
-    )
+            dtype=args.dtype,
+            local_files_only=args.local_files_only,
+            hpo_embeddings_file=args.hpo_embeddings_file or None,
+            hpo_ic_file=args.hpo_ic_file or None,
+        )
         print(f"real MedLatent-H training complete: output_dir={args.output_dir} steps={int(summary['steps'])}")
         return
     dry_run_or_raise(name="train_medlatent_h", config_text=read_config_text(args.config), dry_run=args.dry_run)
