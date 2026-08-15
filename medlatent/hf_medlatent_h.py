@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import importlib.util
 from pathlib import Path
+import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -21,12 +22,18 @@ def _build_position_ids(prefix_mask: torch.Tensor, current_len: int) -> torch.Te
     return starts + offsets
 
 
+def _decoder_forward(model, **kwargs):
+    """Run the decoder without the vocabulary projection used only for loss/generation."""
+    return model.get_base_model()(**kwargs)
+
+
 def _append_embedding(model, embedding: torch.Tensor, prefix_mask: torch.Tensor, past_key_values):
     batch_size = prefix_mask.shape[0]
     inputs = embedding.to(device=prefix_mask.device, dtype=model.get_input_embeddings().weight.dtype)
     inputs = inputs.view(1, 1, -1).expand(batch_size, 1, -1)
     attention_mask = torch.cat([prefix_mask, prefix_mask.new_ones((batch_size, 1))], dim=1)
-    outputs = model(
+    outputs = _decoder_forward(
+        model,
         inputs_embeds=inputs,
         attention_mask=attention_mask,
         position_ids=_build_position_ids(prefix_mask, 1),
@@ -97,6 +104,48 @@ def _assemble_blocks(blocks_by_hospital: dict[int, tuple], hospital_order: list[
     return tuple(combined), mask
 
 
+def _hospital_rollout(model, distiller, boundary, input_ids, attention_mask, *, num_latents: int, device: torch.device):
+    """Encode one or more independent hospital prompts into latent KV blocks."""
+    with torch.no_grad():
+        prompt_out = _decoder_forward(
+            model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            return_dict=True,
+        )
+    past_key_values = prompt_out.past_key_values
+    lengths = attention_mask.sum(dim=1) - 1
+    hidden = prompt_out.last_hidden_state[torch.arange(input_ids.shape[0], device=device), lengths, :]
+    prefix_mask = attention_mask
+    past_key_values, prefix_mask = _append_embedding(model, boundary.begin, prefix_mask, past_key_values)
+    for step in range(int(num_latents)):
+        if step == 0:
+            step_input = distiller.begin_embedding(dtype=model.get_input_embeddings().weight.dtype, device=device)
+            step_input = step_input.expand(input_ids.shape[0], 1, -1)
+        else:
+            step_input = distiller(hidden).unsqueeze(1)
+        attention = torch.cat([prefix_mask, prefix_mask.new_ones((input_ids.shape[0], 1))], dim=1)
+        latent_out = _decoder_forward(
+            model,
+            inputs_embeds=step_input,
+            attention_mask=attention,
+            position_ids=_build_position_ids(prefix_mask, 1),
+            past_key_values=past_key_values,
+            use_cache=True,
+            return_dict=True,
+        )
+        past_key_values = latent_out.past_key_values
+        hidden = latent_out.last_hidden_state[:, -1, :]
+        prefix_mask = attention
+    past_key_values, _ = _append_embedding(model, boundary.end, prefix_mask, past_key_values)
+    return _slice_last_positions(past_key_values, int(num_latents) + 2)
+
+
+def _slice_cache_batch(past_key_values, start: int, end: int):
+    return tuple((key[start:end], value[start:end]) for key, value in _iter_key_value_pairs(past_key_values))
+
+
 def forward_medlatent_h_batch(
     *,
     model,
@@ -106,49 +155,39 @@ def forward_medlatent_h_batch(
     num_latents: int,
     hospital_order: list[int],
     device: torch.device,
+    batch_hospitals: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    # Keep hospital rollouts sequential to bound peak memory, while each
-    # rollout still processes every query in the micro-batch simultaneously.
     hospital_blocks: dict[int, tuple] = {}
-    block_len = int(num_latents) + 2
-    for hospital_id in hospital_order:
-        input_ids = batch["hospital_ids_all"][hospital_id].to(device)
-        attention_mask = batch["hospital_mask_all"][hospital_id].to(device)
-        with torch.no_grad():
-            prompt_out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=True,
-                output_hidden_states=True,
-                return_dict=True,
+    if batch_hospitals:
+        # Hospital-major rows let us split the combined KV cache back per hospital.
+        input_rows = [batch["hospital_ids_all"][hospital_id] for hospital_id in hospital_order]
+        mask_rows = [batch["hospital_mask_all"][hospital_id] for hospital_id in hospital_order]
+        max_length = max(item.shape[1] for item in input_rows)
+        input_ids = torch.cat(
+            [torch.nn.functional.pad(item, (0, max_length - item.shape[1])) for item in input_rows], dim=0
+        ).to(device)
+        attention_mask = torch.cat(
+            [torch.nn.functional.pad(item, (0, max_length - item.shape[1])) for item in mask_rows], dim=0
+        ).to(device)
+        combined_block = _hospital_rollout(
+            model, distiller, boundary, input_ids, attention_mask, num_latents=num_latents, device=device
+        )
+        query_batch_size = input_rows[0].shape[0]
+        for index, hospital_id in enumerate(hospital_order):
+            start = index * query_batch_size
+            hospital_blocks[hospital_id] = _slice_cache_batch(combined_block, start, start + query_batch_size)
+    else:
+        # Sequential hospital rollouts minimize peak memory.
+        for hospital_id in hospital_order:
+            hospital_blocks[hospital_id] = _hospital_rollout(
+                model,
+                distiller,
+                boundary,
+                batch["hospital_ids_all"][hospital_id].to(device),
+                batch["hospital_mask_all"][hospital_id].to(device),
+                num_latents=num_latents,
+                device=device,
             )
-        past_key_values = prompt_out.past_key_values
-        lengths = attention_mask.sum(dim=1) - 1
-        hidden = prompt_out.hidden_states[-1][torch.arange(input_ids.shape[0], device=device), lengths, :]
-        prefix_mask = attention_mask
-
-        past_key_values, prefix_mask = _append_embedding(model, boundary.begin, prefix_mask, past_key_values)
-        for step in range(int(num_latents)):
-            if step == 0:
-                step_input = distiller.begin_embedding(dtype=model.get_input_embeddings().weight.dtype, device=device)
-                step_input = step_input.expand(input_ids.shape[0], 1, -1)
-            else:
-                step_input = distiller(hidden).unsqueeze(1)
-            attention = torch.cat([prefix_mask, prefix_mask.new_ones((input_ids.shape[0], 1))], dim=1)
-            latent_out = model(
-                inputs_embeds=step_input,
-                attention_mask=attention,
-                position_ids=_build_position_ids(prefix_mask, 1),
-                past_key_values=past_key_values,
-                use_cache=True,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            past_key_values = latent_out.past_key_values
-            hidden = latent_out.hidden_states[-1][:, -1, :]
-            prefix_mask = attention
-        past_key_values, _ = _append_embedding(model, boundary.end, prefix_mask, past_key_values)
-        hospital_blocks[hospital_id] = _slice_last_positions(past_key_values, block_len)
 
     legacy_cache, latent_mask = _assemble_blocks(hospital_blocks, hospital_order)
     host_ids = batch["host_question_ids"].to(device)
@@ -211,6 +250,7 @@ def train_medlatent_h_real(
     seed: int = 42,
     device: str = "cuda",
     dtype: str = "bfloat16",
+    batch_hospitals: bool = False,
     local_files_only: bool = False,
     hpo_embeddings_file: str | None = None,
     hpo_ic_file: str | None = None,
@@ -286,6 +326,7 @@ def train_medlatent_h_real(
     hospital_order = list(range(num_hospitals))
     best_val = float("inf")
     global_update = 0
+    micro_iteration = 0
     last_stats: dict[str, float] = {}
 
     def validation_loss() -> float:
@@ -305,6 +346,7 @@ def train_medlatent_h_real(
                     num_latents=num_latents,
                     hospital_order=hospital_order,
                     device=resolved_device,
+                    batch_hospitals=batch_hospitals,
                 )
                 total += float(loss.detach().cpu()) * len(rows)
                 count += len(rows)
@@ -319,6 +361,11 @@ def train_medlatent_h_real(
         update_loss = 0.0
         update_examples = 0
         for start in range(0, len(indices), micro_batch_size):
+            micro_iteration += 1
+            if resolved_device.type == "cuda":
+                torch.cuda.synchronize(resolved_device)
+                torch.cuda.reset_peak_memory_stats(resolved_device)
+            iteration_start = time.perf_counter()
             batch_indices = indices[start : start + micro_batch_size]
             rows = [train_dataset[index] for index in batch_indices]
             batch = collate_medlatent(rows, pad_token_id=tokenizer.pad_token_id)
@@ -330,11 +377,26 @@ def train_medlatent_h_real(
                 num_latents=num_latents,
                 hospital_order=hospital_order,
                 device=resolved_device,
+                batch_hospitals=batch_hospitals,
             )
             batch_examples = len(rows)
             (loss * batch_examples).backward()
             update_loss += float(loss.detach().cpu()) * batch_examples
             update_examples += batch_examples
+            if resolved_device.type == "cuda":
+                torch.cuda.synchronize(resolved_device)
+                allocated_gb = torch.cuda.memory_allocated(resolved_device) / 1024**3
+                peak_gb = torch.cuda.max_memory_allocated(resolved_device) / 1024**3
+                memory_text = f"gpu={allocated_gb:.1f}/{peak_gb:.1f}G"
+            else:
+                memory_text = "gpu=n/a"
+            elapsed = time.perf_counter() - iteration_start
+            throughput = batch_examples / max(elapsed, 1e-9)
+            print(
+                f"iter={micro_iteration} e={epoch + 1} loss={stats['loss_ce']:.4f} "
+                f"t={elapsed:.2f}s ex/s={throughput:.2f} {memory_text} "
+                f"acc={update_examples}/{effective_batch_size}"
+            )
             is_last = start + micro_batch_size >= len(indices)
             if update_examples >= effective_batch_size or is_last:
                 divisor = update_examples

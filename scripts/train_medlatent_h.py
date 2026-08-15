@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--max_prompt_length", type=int, default=320)
     parser.add_argument("--max_target_length", type=int, default=64)
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_hospitals", action="store_true", help="Run all hospitals together at each latent step; uses more VRAM.")
     parser.add_argument("--effective_batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--warmup_steps", type=int, default=100)
@@ -60,6 +61,7 @@ def main() -> None:
             max_prompt_length=args.max_prompt_length,
             max_target_length=args.max_target_length,
             batch_size=args.batch_size,
+            batch_hospitals=args.batch_hospitals,
             effective_batch_size=args.effective_batch_size,
             epochs=args.epochs,
             warmup_steps=args.warmup_steps,
