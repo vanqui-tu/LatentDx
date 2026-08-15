@@ -23,6 +23,7 @@ class HpoCosineRetriever:
         if not self.term_embeddings:
             raise ValueError("term_embeddings must not be empty")
         self.embedding_dim = int(next(iter(self.term_embeddings.values())).shape[0])
+        self._record_indexes: dict[int, tuple[Sequence[Mapping[str, object]], np.ndarray]] = {}
 
     def encode(self, hpo_codes: Sequence[str]) -> np.ndarray:
         vectors = []
@@ -55,9 +56,24 @@ class HpoCosineRetriever:
         top_k: int = 1,
     ) -> list[RetrievalResult]:
         query = self.encode(query_hpo_codes)
-        scored: list[RetrievalResult] = []
-        for record in records:
-            candidate = self.encode(record.get("hpo_codes", []))  # type: ignore[arg-type]
-            scored.append(RetrievalResult(record=record, score=self.cosine(query, candidate)))
-        scored.sort(key=lambda item: item.score, reverse=True)
-        return scored[: max(0, min(int(top_k), len(scored)))]
+        cache_key = id(records)
+        cached = self._record_indexes.get(cache_key)
+        if cached is None or cached[0] is not records:
+            candidate_vectors = np.stack(
+                [self.encode(record.get("hpo_codes", [])) for record in records],  # type: ignore[arg-type]
+                axis=0,
+            ) if records else np.empty((0, self.embedding_dim), dtype=np.float32)
+            norms = np.linalg.norm(candidate_vectors, axis=1)
+            self._record_indexes[cache_key] = (records, candidate_vectors / np.maximum(norms[:, None], 1e-12))
+            cached = self._record_indexes[cache_key]
+
+        if not records or top_k <= 0:
+            return []
+        query_norm = float(np.linalg.norm(query))
+        if query_norm == 0.0:
+            scores = np.zeros(len(records), dtype=np.float32)
+        else:
+            scores = cached[1] @ (query / query_norm)
+        count = min(int(top_k), len(records))
+        indices = np.argsort(-scores, kind="stable")[:count]
+        return [RetrievalResult(record=records[index], score=float(scores[index])) for index in indices]
