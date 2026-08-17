@@ -1,0 +1,33 @@
+{
+  "output_dir": "data_original",
+  "partition_strategy": "stratified",
+  "seed": 42,
+  "split_sizes": {
+    "train": 7220,
+    "val": 401,
+    "test": 401
+  },
+  "hospital_sizes": [
+    1444,
+    1444,
+    1444,
+    1444,
+    1444
+  ],
+  "unmapped_disease_ids": {
+    "OMIM:601674": 19,
+    "OMIM:621193": 10
+  },
+  "unmapped_phenotype_ids": {
+    "HP:0006957": 1,
+    "HP:0025848": 3,
+    "HP:0035023": 12,
+    "HP:0040083": 1,
+    "HP:5200320": 1,
+    "HP:5200321": 1,
+    "HP:6000236": 1,
+    "HP:6000264": 1,
+    "HP:6000980": 1,
+    "HP:6001114": 2
+  }
+}
