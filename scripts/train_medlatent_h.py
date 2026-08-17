@@ -39,8 +39,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     parser.add_argument("--local_files_only", action="store_true")
-    parser.add_argument("--hpo_embeddings_file", default="", help="Optional HPO embedding JSON for IC-weighted cosine retrieval.")
-    parser.add_argument("--hpo_ic_file", default="", help="Optional HPO information-content JSON for IC-weighted cosine retrieval.")
+    parser.add_argument("--hpo_embeddings_file", default="", help="HPO embedding JSON required for IC-weighted cosine retrieval.")
+    parser.add_argument("--hpo_ic_file", default="", help="HPO information-content JSON required for IC-weighted cosine retrieval.")
     args = parser.parse_args()
     if args.toy:
         metrics = train_toy_medlatent_h(args.output_dir, steps=args.steps, seed=args.seed)

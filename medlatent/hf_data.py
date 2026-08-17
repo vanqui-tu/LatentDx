@@ -74,14 +74,6 @@ def _omim_code(row: dict[str, Any]) -> str:
     return str(row.get("omim_id") or row.get("disease_code") or _disease_name(row))
 
 
-def _jaccard(query: list[str], candidate: list[str]) -> float:
-    left, right = set(query), set(candidate)
-    union = left | right
-    if not union:
-        return 0.0
-    return len(left & right) / len(union)
-
-
 def _tokenize(tokenizer, text: str, max_len: int | None = None) -> list[int]:
     if max_len is not None:
         return tokenizer(text, add_special_tokens=False, truncation=True, max_length=max_len)["input_ids"]
@@ -124,11 +116,13 @@ class MedLatentDiagnosisDataset(Dataset):
         for hospital_id in range(self.num_hospitals):
             path = Path(hospital_dir) / f"hospital_{hospital_id}.json"
             self.hospitals.append([self._normalize(row, idx) for idx, row in enumerate(_read_json(path))])
-        self.retriever = None
-        if hpo_embeddings_file and hpo_ic_file:
-            embeddings = _read_json_object(hpo_embeddings_file)
-            ic_weights = _read_json_object(hpo_ic_file)
-            self.retriever = HpoCosineRetriever(embeddings, ic_weights)
+        if not hpo_embeddings_file or not hpo_ic_file:
+            raise ValueError(
+                "HPO cosine retrieval requires both hpo_embeddings_file and hpo_ic_file"
+            )
+        embeddings = _read_json_object(hpo_embeddings_file)
+        ic_weights = _read_json_object(hpo_ic_file)
+        self.retriever = HpoCosineRetriever(embeddings, ic_weights)
         self.examples = [self._build_example(idx) for idx in range(len(self.records))]
 
     def _normalize(self, row: dict[str, Any], idx: int) -> dict[str, Any]:
@@ -144,9 +138,16 @@ class MedLatentDiagnosisDataset(Dataset):
         candidates = self.hospitals[hospital_id]
         if not candidates:
             raise ValueError(f"Hospital {hospital_id} has no records")
-        if self.retriever is not None:
-            return dict(self.retriever.rank(record["hpo_codes"], candidates, top_k=1)[0].record)
-        return max(candidates, key=lambda item: _jaccard(record["hpo_codes"], item["hpo_codes"]))
+        ranked = self.retriever.rank(record["hpo_codes"], candidates, top_k=2)
+        if not ranked:
+            raise ValueError(f"Hospital {hospital_id} has no candidates")
+        selected = ranked[0].record
+        if (
+            str(selected.get("case_id") or selected.get("id") or "") == record["case_id"]
+            and len(ranked) > 1
+        ):
+            selected = ranked[1].record
+        return dict(selected)
 
     def _build_example(self, idx: int) -> dict[str, Any]:
         record = self.records[idx]

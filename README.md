@@ -124,7 +124,7 @@ $MEDLATENT_DATA_DIR/
 
 Each diagnosis row contains HPO codes under `Phenotype`, diseases under `RareDisease`, and optionally disease/phenotype names in the hospital shards.
 
-If `--hpo_embeddings_file` and `--hpo_ic_file` are provided, retrieval uses IC-weighted HPO cosine similarity. If they are omitted, the runtime falls back to HPO-set Jaccard retrieval; this fallback is intended for smoke tests, not paper-number reproduction.
+`--hpo_embeddings_file` and `--hpo_ic_file` are required for real-data retrieval, which uses IC-weighted HPO cosine similarity. The runtime fails explicitly when either file is missing; there is no silent retrieval fallback.
 
 ## Real MedLatent-H Training
 
