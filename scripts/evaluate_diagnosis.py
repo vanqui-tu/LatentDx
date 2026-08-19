@@ -31,7 +31,7 @@ def main() -> None:
     parser.add_argument("--max_prompt_length", type=int, default=320)
     parser.add_argument("--max_target_length", type=int, default=64)
     parser.add_argument("--max_new_tokens", type=int, default=64)
-    parser.add_argument("--max_samples", type=int, default=100)
+    parser.add_argument("--max_samples", type=int, default=1000)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     parser.add_argument("--local_files_only", action="store_true")
