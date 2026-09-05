@@ -106,3 +106,27 @@ def test_disconnected_graph_is_labeled_unreachable():
     assert graph.minimum_request_return_rounds(0, 1) is None
     with pytest.raises(ValueError, match="disconnected"):
         graph.diameter()
+
+
+def test_graph_serialization_round_trip_preserves_edges_metadata_and_hash(tmp_path):
+    graph = CommunicationGraph(
+        np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]]),
+        metadata={"kind": "fixture", "parameters": {"seed": 42}},
+    )
+    path = tmp_path / "graph.json"
+    graph.save(path)
+    restored = CommunicationGraph.load(path)
+
+    assert restored.edge_list() == ((0, 1), (1, 2))
+    assert np.array_equal(restored.adjacency, graph.adjacency)
+    assert dict(restored.metadata) == {"kind": "fixture", "parameters": {"seed": 42}}
+    assert restored.graph_hash == graph.graph_hash
+
+
+def test_graph_hash_is_independent_of_metadata_key_order():
+    adjacency = np.array([[0, 1], [1, 0]])
+
+    left = CommunicationGraph(adjacency, metadata={"kind": "fixture", "seed": 42})
+    right = CommunicationGraph(adjacency, metadata={"seed": 42, "kind": "fixture"})
+
+    assert left.graph_hash == right.graph_hash

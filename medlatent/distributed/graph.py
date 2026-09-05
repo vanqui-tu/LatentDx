@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from hashlib import sha256
+import json
 from numbers import Integral
-from typing import Any
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -25,6 +29,7 @@ class CommunicationGraph:
     """An immutable simple undirected graph over stable integer agent IDs."""
 
     adjacency: NDArray[np.bool_]
+    metadata: Mapping[str, Any] = field(default_factory=dict)
     num_agents: int = field(init=False)
     agent_ids: tuple[int, ...] = field(init=False)
 
@@ -45,8 +50,90 @@ class CommunicationGraph:
 
         immutable_adjacency = np.frombuffer(adjacency.tobytes(), dtype=np.bool_).reshape(adjacency.shape)
         object.__setattr__(self, "adjacency", immutable_adjacency)
+        object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
         object.__setattr__(self, "num_agents", adjacency.shape[0])
         object.__setattr__(self, "agent_ids", tuple(range(adjacency.shape[0])))
+
+    @property
+    def graph_hash(self) -> str:
+        """Return the stable SHA-256 identity of this graph and its metadata."""
+
+        return sha256(self.to_json().encode("utf-8")).hexdigest()
+
+    def edge_list(self) -> tuple[tuple[int, int], ...]:
+        """Return each undirected edge once in canonical agent-ID order."""
+
+        return tuple(
+            (source_id, target_id)
+            for source_id in self.agent_ids
+            for target_id in self.neighbors(source_id)
+            if source_id < target_id
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible canonical graph representation."""
+
+        return {
+            "num_agents": self.num_agents,
+            "edges": [list(edge) for edge in self.edge_list()],
+            "metadata": _thaw_metadata(self.metadata),
+        }
+
+    def to_json(self) -> str:
+        """Serialize the graph deterministically as compact JSON."""
+
+        return json.dumps(self.to_dict(), allow_nan=False, separators=(",", ":"), sort_keys=True)
+
+    def save(self, path: str | Path) -> None:
+        """Write the canonical graph JSON to ``path``."""
+
+        Path(path).write_text(f"{self.to_json()}\n", encoding="utf-8")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CommunicationGraph:
+        """Construct a graph from its canonical edge-list representation."""
+
+        if not isinstance(data, Mapping):
+            raise ValueError("graph data must be a mapping")
+        count = _validate_num_agents(data.get("num_agents"))
+        edges = data.get("edges")
+        if not isinstance(edges, Sequence) or isinstance(edges, (str, bytes)):
+            raise ValueError("edges must be a sequence of agent-ID pairs")
+
+        adjacency = np.zeros((count, count), dtype=np.bool_)
+        seen_edges: set[tuple[int, int]] = set()
+        for edge in edges:
+            if not isinstance(edge, Sequence) or isinstance(edge, (str, bytes)) or len(edge) != 2:
+                raise ValueError("each edge must contain exactly two agent IDs")
+            source_id = _validate_agent_id_for_count(edge[0], count)
+            target_id = _validate_agent_id_for_count(edge[1], count)
+            if source_id == target_id:
+                raise ValueError("self-loops are not allowed")
+            normalized_edge = tuple(sorted((source_id, target_id)))
+            if normalized_edge in seen_edges:
+                raise ValueError("duplicate undirected edge")
+            seen_edges.add(normalized_edge)
+            adjacency[source_id, target_id] = True
+            adjacency[target_id, source_id] = True
+
+        metadata = data.get("metadata", {})
+        return cls(adjacency, metadata=metadata)
+
+    @classmethod
+    def from_json(cls, serialized: str) -> CommunicationGraph:
+        """Construct a graph from canonical JSON."""
+
+        try:
+            data = json.loads(serialized)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError("graph JSON is invalid") from error
+        return cls.from_dict(data)
+
+    @classmethod
+    def load(cls, path: str | Path) -> CommunicationGraph:
+        """Load a canonical graph JSON file."""
+
+        return cls.from_json(Path(path).read_text(encoding="utf-8"))
 
     def neighbors(self, agent_id: int) -> tuple[int, ...]:
         """Return direct neighbors in ascending stable agent-ID order."""
@@ -141,7 +228,7 @@ def complete_graph(num_agents: int) -> CommunicationGraph:
     count = _validate_num_agents(num_agents)
     adjacency = np.ones((count, count), dtype=np.bool_)
     np.fill_diagonal(adjacency, False)
-    return CommunicationGraph(adjacency)
+    return CommunicationGraph(adjacency, metadata={"kind": "complete"})
 
 
 def path_graph(num_agents: int) -> CommunicationGraph:
@@ -152,7 +239,7 @@ def path_graph(num_agents: int) -> CommunicationGraph:
     indices = np.arange(count - 1)
     adjacency[indices, indices + 1] = True
     adjacency[indices + 1, indices] = True
-    return CommunicationGraph(adjacency)
+    return CommunicationGraph(adjacency, metadata={"kind": "path"})
 
 
 def ring_graph(num_agents: int) -> CommunicationGraph:
@@ -164,7 +251,7 @@ def ring_graph(num_agents: int) -> CommunicationGraph:
     adjacency = path_graph(count).adjacency.copy()
     adjacency[0, count - 1] = True
     adjacency[count - 1, 0] = True
-    return CommunicationGraph(adjacency)
+    return CommunicationGraph(adjacency, metadata={"kind": "ring"})
 
 
 def star_graph(num_agents: int) -> CommunicationGraph:
@@ -174,7 +261,7 @@ def star_graph(num_agents: int) -> CommunicationGraph:
     adjacency = np.zeros((count, count), dtype=np.bool_)
     adjacency[0, 1:] = True
     adjacency[1:, 0] = True
-    return CommunicationGraph(adjacency)
+    return CommunicationGraph(adjacency, metadata={"kind": "star", "center": 0})
 
 
 def random_regular_graph(num_agents: int, degree: int, *, seed: int) -> CommunicationGraph:
@@ -192,7 +279,10 @@ def random_regular_graph(num_agents: int, degree: int, *, seed: int) -> Communic
     permutation = rng.permutation(count)
     adjacency = adjacency[np.ix_(permutation, permutation)]
     _randomize_regular_edges(adjacency, rng)
-    return CommunicationGraph(adjacency)
+    return CommunicationGraph(
+        adjacency,
+        metadata={"kind": "random_regular", "degree": regular_degree, "seed": int(seed)},
+    )
 
 
 def _validate_num_agents(num_agents: int) -> int:
@@ -206,6 +296,54 @@ def _validate_nonnegative_integer(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
     return int(value)
+
+
+def _validate_agent_id_for_count(agent_id: Any, count: int) -> int:
+    if isinstance(agent_id, bool) or not isinstance(agent_id, Integral):
+        raise ValueError(f"invalid agent ID: {agent_id!r}")
+    normalized_id = int(agent_id)
+    if normalized_id < 0 or normalized_id >= count:
+        raise ValueError(f"invalid agent ID: {agent_id!r}")
+    return normalized_id
+
+
+def _validate_probability(value: float, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")
+    return float(value)
+
+
+def _freeze_metadata(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
+    if not isinstance(metadata, Mapping):
+        raise ValueError("metadata must be a mapping")
+    frozen: dict[str, Any] = {}
+    for key, value in metadata.items():
+        if not isinstance(key, str):
+            raise ValueError("metadata keys must be strings")
+        frozen[key] = _freeze_metadata_value(value)
+    return MappingProxyType(frozen)
+
+
+def _freeze_metadata_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            raise ValueError("metadata floats must be finite")
+        return value
+    if isinstance(value, Mapping):
+        return _freeze_metadata(value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return tuple(_freeze_metadata_value(item) for item in value)
+    raise ValueError(f"metadata value is not JSON-compatible: {value!r}")
+
+
+def _thaw_metadata(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_metadata(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_metadata(item) for item in value]
+    return value
 
 
 def _circulant_regular_adjacency(num_agents: int, degree: int) -> NDArray[np.bool_]:
