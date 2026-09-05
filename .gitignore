@@ -8,6 +8,8 @@ venv/
 dist/
 build/
 *.egg-info/
+tmp/
+archived/
 
 # Large artifacts are documented, not committed.
 *.pt
@@ -19,6 +21,9 @@ artifacts/
 outputs/
 cache/
 latent_caches/
+*.ipynb
+# *.md
+outputs*/
 
 # Local environment files.
 .env
