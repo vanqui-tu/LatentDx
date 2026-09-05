@@ -37,7 +37,9 @@ def test_payload_cost_is_deterministic_and_counts_utf8_bytes():
     cost = CommunicationCost.from_payload(payload)
 
     assert cost.wire_bytes == cost.logical_size
-    assert cost.wire_bytes == len(b'{"candidate_labels":["DX:1","DX:2"],"request_type":"consult","type":"request"}')
+    assert cost.wire_bytes == len(
+        b'{"candidate_labels":["DX:1","DX:2"],"request_type":"consult","type":"request","visited_agent_ids":[]}'
+    )
 
 
 def test_message_rejects_mismatched_kind_and_payload():

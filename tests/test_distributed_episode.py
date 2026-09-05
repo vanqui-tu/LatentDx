@@ -56,6 +56,7 @@ def test_episode_state_isolated_between_episodes_and_deduplicates_messages():
     assert second is not first
     assert second.current_inbox == ()
     assert second.next_inbox == []
+    assert second.received_messages == []
     assert second.seen_message_ids == set()
 
 

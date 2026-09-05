@@ -17,9 +17,11 @@ class AgentEpisodeState:
     query: object
     current_inbox: tuple[MessageEnvelope, ...] = ()
     next_inbox: list[MessageEnvelope] = field(default_factory=list)
+    received_messages: list[MessageEnvelope] = field(default_factory=list)
     seen_message_ids: set[str] = field(default_factory=set)
     local_proposal: ProposalPayload | None = None
     parent_message_id: str | None = None
+    parent_agent_id: int | None = None
     active: bool = False
 
     def queue_for_next_round(self, message: MessageEnvelope) -> bool:
@@ -29,16 +31,20 @@ class AgentEpisodeState:
             raise ValueError("message receiver does not match state owner")
         if message.message_id in self.seen_message_ids:
             return False
+        if message.kind is MessageKind.REQUEST and self.parent_message_id is not None:
+            return False
         self.seen_message_ids.add(message.message_id)
         self.next_inbox.append(message)
         if message.kind is MessageKind.REQUEST and self.parent_message_id is None:
             self.parent_message_id = message.message_id
+            self.parent_agent_id = message.sender_id
         self.active = True
         return True
 
     def begin_round(self) -> tuple[MessageEnvelope, ...]:
         self.current_inbox = tuple(self.next_inbox)
         self.next_inbox.clear()
+        self.received_messages.extend(self.current_inbox)
         return self.current_inbox
 
     def set_local_proposal(self, proposal: ProposalPayload | None) -> None:

@@ -22,14 +22,21 @@ class MessageKind(str, Enum):
 class RequestPayload:
     request_type: str
     candidate_labels: tuple[str, ...] = ()
+    visited_agent_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.request_type:
             raise ValueError("request_type must not be empty")
         object.__setattr__(self, "candidate_labels", _labels(self.candidate_labels))
+        object.__setattr__(self, "visited_agent_ids", _agent_ids(self.visited_agent_ids))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"type": "request", "request_type": self.request_type, "candidate_labels": list(self.candidate_labels)}
+        return {
+            "type": "request",
+            "request_type": self.request_type,
+            "candidate_labels": list(self.candidate_labels),
+            "visited_agent_ids": list(self.visited_agent_ids),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,7 +242,11 @@ def _payload_from_dict(data: Mapping[str, Any]) -> StructuredPayload:
     payload_type = data.get("type")
     try:
         if payload_type == "request":
-            return RequestPayload(data["request_type"], tuple(data.get("candidate_labels", ())))
+            return RequestPayload(
+                data["request_type"],
+                tuple(data.get("candidate_labels", ())),
+                tuple(data.get("visited_agent_ids", ())),
+            )
         if payload_type == "evidence":
             return EvidencePayload(data["candidate_label"], data["evidence_present"], data["score"])
         if payload_type == "proposal":
@@ -264,6 +275,15 @@ def _labels(labels: Sequence[str]) -> tuple[str, ...]:
     if isinstance(labels, (str, bytes)):
         raise ValueError("candidate_labels must be a sequence of labels")
     return tuple(_label(label, "candidate label") for label in labels)
+
+
+def _agent_ids(agent_ids: Sequence[int]) -> tuple[int, ...]:
+    if isinstance(agent_ids, (str, bytes)):
+        raise ValueError("visited_agent_ids must be a sequence of agent IDs")
+    normalized = tuple(_nonnegative_integer(agent_id, "visited agent ID") for agent_id in agent_ids)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("visited_agent_ids must not contain duplicates")
+    return normalized
 
 
 def _label(value: str, name: str) -> str:
