@@ -99,7 +99,11 @@ class SynchronousEpisodeEngine:
             for agent_id in active_agents:
                 state = states[agent_id]
                 events.append(EpisodeEvent(round_index=round_index, event_type="activated", agent_id=agent_id))
-                outgoing = tuple(handler(self.agents[agent_id], state, round_index))
+                state.processing = True
+                try:
+                    outgoing = tuple(handler(self.agents[agent_id], state, round_index))
+                finally:
+                    state.processing = False
                 self._send_batch(
                     outgoing,
                     episode_id=episode_id,

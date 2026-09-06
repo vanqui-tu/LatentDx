@@ -25,6 +25,20 @@ from .messages import (
     ProposalPayload,
     RequestPayload,
 )
+from .medical import (
+    HospitalPrivateStore,
+    MedicalDatasetSplits,
+    MedicalEpisode,
+    MedicalQuery,
+    MedicalQueryRecord,
+    MedicalRetrievedRecord,
+    RetrievalAuditEvent,
+    build_medical_agents,
+    load_hospital_private_stores,
+    load_medical_dataset_splits,
+    load_medical_split,
+    sample_balanced_sources,
+)
 from .store import PrivateKnowledgeStore, SyntheticKnowledgeRecord, SyntheticKnowledgeStore
 from .routing import DirectNeighborRouter, FloodUnvisitedRouter, RandomKRouter, Router
 from .results import EpisodeLogRecord
@@ -47,10 +61,17 @@ __all__ = [
     "EvidencePayload",
     "MessageEnvelope",
     "MessageKind",
+    "HospitalPrivateStore",
+    "MedicalDatasetSplits",
+    "MedicalEpisode",
+    "MedicalQuery",
+    "MedicalQueryRecord",
+    "MedicalRetrievedRecord",
     "PrivateKnowledgeStore",
     "ProposalPayload",
     "RequestPayload",
     "Router",
+    "RetrievalAuditEvent",
     "RandomKRouter",
     "DirectNeighborRouter",
     "FloodUnvisitedRouter",
@@ -60,6 +81,7 @@ __all__ = [
     "SyntheticKnowledgeStore",
     "TopologyConfig",
     "complementary_evidence_fixture",
+    "build_medical_agents",
     "complete_graph",
     "path_graph",
     "random_regular_graph",
@@ -68,6 +90,10 @@ __all__ = [
     "majority_vote",
     "max_confidence",
     "mean_score",
+    "load_hospital_private_stores",
+    "load_medical_dataset_splits",
+    "load_medical_split",
     "require_all_evidence",
     "run_baseline",
+    "sample_balanced_sources",
 ]

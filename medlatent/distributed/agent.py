@@ -23,6 +23,7 @@ class AgentEpisodeState:
     parent_message_id: str | None = None
     parent_agent_id: int | None = None
     active: bool = False
+    processing: bool = False
 
     def queue_for_next_round(self, message: MessageEnvelope) -> bool:
         if message.episode_id != self.episode_id:
@@ -74,6 +75,12 @@ class AgentRuntime:
 
     def retrieve_local(self, query: object, *, limit: int | None = None) -> tuple[Any, ...]:
         return self.__store.retrieve(query, limit=limit)
+
+    def retrieve_active_episode(self, episode_id: str, *, limit: int | None = None) -> tuple[Any, ...]:
+        state = self.state_for(episode_id)
+        if not state.processing:
+            raise RuntimeError("local retrieval is allowed only while the agent is activated")
+        return self.retrieve_local(state.query, limit=limit)
 
     def start_episode(self, episode_id: str, query: object) -> AgentEpisodeState:
         if not episode_id:
