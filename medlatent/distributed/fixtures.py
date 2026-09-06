@@ -19,18 +19,20 @@ class ComplementaryEvidenceFixture:
     necessary_agent_ids: tuple[int, ...]
 
     def build_agents(self) -> dict[int, AgentRuntime]:
-        stores = {
-            0: SyntheticKnowledgeStore(()),
-            1: SyntheticKnowledgeStore((SyntheticKnowledgeRecord("private-a", self.query, "EVIDENCE:A"),)),
-            2: SyntheticKnowledgeStore((SyntheticKnowledgeRecord("private-b", self.query, "EVIDENCE:B"),)),
-        }
+        stores = {agent_id: SyntheticKnowledgeStore(()) for agent_id in self.graph.agent_ids}
+        stores[1] = SyntheticKnowledgeStore(
+            (SyntheticKnowledgeRecord("private-a", self.query, "EVIDENCE:A"),)
+        )
+        stores[2] = SyntheticKnowledgeStore(
+            (SyntheticKnowledgeRecord("private-b", self.query, "EVIDENCE:B"),)
+        )
         return {agent_id: AgentRuntime(agent_id, stores[agent_id]) for agent_id in self.graph.agent_ids}
 
 
 def complementary_evidence_fixture(graph: CommunicationGraph | None = None) -> ComplementaryEvidenceFixture:
     topology = graph or path_graph(3)
-    if topology.num_agents != 3:
-        raise ValueError("complementary evidence fixture requires exactly three agents")
+    if topology.num_agents < 3:
+        raise ValueError("complementary evidence fixture requires at least three agents")
     return ComplementaryEvidenceFixture(
         graph=topology,
         query=("signal-a", "signal-b"),
