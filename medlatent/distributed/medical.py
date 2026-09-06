@@ -39,6 +39,7 @@ class MedicalEpisode:
 class MedicalRetrievedRecord:
     record_id: str
     label: str
+    phenotype_text: str
     score: float
 
 
@@ -90,6 +91,7 @@ class HospitalPrivateStore(PrivateKnowledgeStore[MedicalRetrievedRecord]):
             MedicalRetrievedRecord(
                 record_id=str(result.record["case_id"]),
                 label=str(result.record["disease_name"]),
+                phenotype_text=str(result.record["phenotype_text"]),
                 score=result.score,
             )
             for result in ranked
@@ -224,6 +226,7 @@ def _normalize_record(row: Mapping[str, object], index: int) -> dict[str, object
         "case_id": _case_id(row, index),
         "hpo_codes": _hpo_codes(row),
         "disease_name": _disease_name(row),
+        "phenotype_text": _phenotype_text(row),
     }
 
 

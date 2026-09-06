@@ -4,7 +4,8 @@ from .agent import AgentEpisodeState, AgentRuntime
 from .aggregation import AggregatedProposal, majority_vote, max_confidence, mean_score, require_all_evidence
 from .baselines import BaselineKind, BaselineResult, run_baseline
 from .medical_baselines import MedicalBaselineKind, MedicalBaselineResult, MedicalTraceEvent, run_medical_baseline
-from .channels import StructuredChannel
+from .textmas import TextGeneration, TextGenerator, TransformersTextGenerator, build_agent_prompt, build_host_prompt, parse_textmas_answer
+from .channels import StructuredChannel, TextChannel, find_raw_substring_leaks
 from .config import DistributedBaselineConfig, TopologyConfig
 from .episode import EpisodeEvent, EpisodeResult, SynchronousEpisodeEngine
 from .fixtures import ComplementaryEvidenceFixture, complementary_evidence_fixture
@@ -25,6 +26,8 @@ from .messages import (
     MessageKind,
     ProposalPayload,
     RequestPayload,
+    TextProposalPayload,
+    TextRequestPayload,
 )
 from .medical import (
     HospitalPrivateStore,
@@ -54,6 +57,9 @@ __all__ = [
     "MedicalBaselineKind",
     "MedicalBaselineResult",
     "MedicalTraceEvent",
+    "TextGeneration",
+    "TextGenerator",
+    "TransformersTextGenerator",
     "CommunicationCost",
     "CommunicationGraph",
     "ComplementaryEvidenceFixture",
@@ -81,6 +87,10 @@ __all__ = [
     "FloodUnvisitedRouter",
     "PublicExpertiseRouter",
     "StructuredChannel",
+    "TextChannel",
+    "TextProposalPayload",
+    "TextRequestPayload",
+    "find_raw_substring_leaks",
     "SynchronousEpisodeEngine",
     "SyntheticKnowledgeRecord",
     "SyntheticKnowledgeStore",
@@ -101,5 +111,8 @@ __all__ = [
     "require_all_evidence",
     "run_baseline",
     "run_medical_baseline",
+    "build_agent_prompt",
+    "build_host_prompt",
+    "parse_textmas_answer",
     "sample_balanced_sources",
 ]

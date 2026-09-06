@@ -88,7 +88,49 @@ class AckPayload:
         return {"type": "ack", "accepted": self.accepted}
 
 
+@dataclass(frozen=True, slots=True)
+class TextRequestPayload:
+    text: str
+    visited_agent_ids: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("text must not be empty")
+        object.__setattr__(self, "visited_agent_ids", _agent_ids(self.visited_agent_ids))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"type": "text_request", "text": self.text, "visited_agent_ids": list(self.visited_agent_ids)}
+
+
+@dataclass(frozen=True, slots=True)
+class TextProposalPayload:
+    text: str
+    candidate_label: str
+    score: float
+    confidence: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("text must not be empty")
+        _label(self.candidate_label, "candidate_label")
+        _finite(self.score, "score")
+        confidence = _finite(self.confidence, "confidence")
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError("confidence must be between 0 and 1")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "text_proposal",
+            "text": self.text,
+            "candidate_label": self.candidate_label,
+            "score": self.score,
+            "confidence": self.confidence,
+        }
+
+
 StructuredPayload = RequestPayload | EvidencePayload | ProposalPayload | AckPayload
+TextPayload = TextRequestPayload | TextProposalPayload
+Payload = StructuredPayload | TextPayload
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +148,7 @@ class CommunicationCost:
             _nonnegative_integer(value, name)
 
     @classmethod
-    def from_payload(cls, payload: StructuredPayload) -> CommunicationCost:
+    def from_payload(cls, payload: Payload) -> CommunicationCost:
         wire_bytes = len(_canonical_json(payload.to_dict()).encode("utf-8"))
         return cls(logical_size=wire_bytes, wire_bytes=wire_bytes)
 
@@ -127,7 +169,7 @@ class MessageEnvelope:
     receiver_id: int
     kind: MessageKind
     ttl: int
-    payload: StructuredPayload
+    payload: Payload
     cost: CommunicationCost
     parent_message_id: str | None = None
 
@@ -163,9 +205,10 @@ class MessageEnvelope:
         receiver_id: int,
         kind: MessageKind,
         ttl: int,
-        payload: StructuredPayload,
+        payload: Payload,
         parent_message_id: str | None = None,
         message_id: str | None = None,
+        cost: CommunicationCost | None = None,
     ) -> MessageEnvelope:
         return cls(
             message_id=message_id or new_message_id(),
@@ -176,7 +219,7 @@ class MessageEnvelope:
             kind=kind,
             ttl=ttl,
             payload=payload,
-            cost=CommunicationCost.from_payload(payload),
+            cost=CommunicationCost.from_payload(payload) if cost is None else cost,
             parent_message_id=parent_message_id,
         )
 
@@ -236,7 +279,7 @@ def new_message_id() -> str:
     return uuid4().hex
 
 
-def _payload_from_dict(data: Mapping[str, Any]) -> StructuredPayload:
+def _payload_from_dict(data: Mapping[str, Any]) -> Payload:
     if not isinstance(data, Mapping):
         raise ValueError("payload must be a mapping")
     payload_type = data.get("type")
@@ -253,18 +296,24 @@ def _payload_from_dict(data: Mapping[str, Any]) -> StructuredPayload:
             return ProposalPayload(data["candidate_label"], data["score"], data["confidence"])
         if payload_type == "ack":
             return AckPayload(data["accepted"])
+        if payload_type == "text_request":
+            return TextRequestPayload(data["text"], tuple(data.get("visited_agent_ids", ())))
+        if payload_type == "text_proposal":
+            return TextProposalPayload(data["text"], data["candidate_label"], data["score"], data["confidence"])
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("payload data is invalid") from error
     raise ValueError("unknown payload type")
 
 
-def _kind_matches_payload(kind: MessageKind, payload: StructuredPayload) -> bool:
+def _kind_matches_payload(kind: MessageKind, payload: Payload) -> bool:
     return {
         MessageKind.REQUEST: RequestPayload,
         MessageKind.EVIDENCE: EvidencePayload,
         MessageKind.PROPOSAL: ProposalPayload,
         MessageKind.ACK: AckPayload,
-    }[kind] is type(payload)
+    }[kind] is type(payload) or (
+        kind is MessageKind.REQUEST and isinstance(payload, TextRequestPayload)
+    ) or (kind is MessageKind.PROPOSAL and isinstance(payload, TextProposalPayload))
 
 
 def _canonical_json(data: Mapping[str, Any]) -> str:

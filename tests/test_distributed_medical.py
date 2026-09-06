@@ -108,6 +108,7 @@ def test_medical_split_rejects_case_ids_shared_by_evaluation_splits(tmp_path: Pa
 
 def test_structured_medical_b0_to_b4_share_engine_and_emit_failure_stages(tmp_path: Path):
     hospital_dir, embeddings, ic = _medical_files(tmp_path)
+    _write_json(hospital_dir / "hospital_1.json", [_row("h1-match", "HP:1", "Disease one")])
     _write_json(hospital_dir / "hospital_2.json", [_row("h2-match", "HP:1", "Disease two")])
     stores = load_hospital_private_stores(
         hospital_dir,
@@ -121,6 +122,16 @@ def test_structured_medical_b0_to_b4_share_engine_and_emit_failure_stages(tmp_pa
 
     local = run_medical_baseline(episode, graph, agents, MedicalBaselineKind.LOCAL_ONLY, max_rounds=0, max_fanout=1)
     one_hop = run_medical_baseline(episode, graph, agents, MedicalBaselineKind.ONE_HOP, max_rounds=2, max_fanout=1)
+    text_one_hop = run_medical_baseline(
+        episode,
+        graph,
+        agents,
+        MedicalBaselineKind.ONE_HOP,
+        max_rounds=2,
+        max_fanout=1,
+        channel="text",
+        private_values=("Disease one",),
+    )
     flooding = run_medical_baseline(episode, graph, agents, MedicalBaselineKind.FLOODING, max_rounds=4, max_fanout=2)
     random_k = run_medical_baseline(episode, graph, agents, MedicalBaselineKind.RANDOM_K, max_rounds=4, max_fanout=2, seed=42)
     heuristic = run_medical_baseline(
@@ -135,6 +146,24 @@ def test_structured_medical_b0_to_b4_share_engine_and_emit_failure_stages(tmp_pa
 
     assert local.prediction == "Disease zero"
     assert one_hop.prediction == "Disease zero"
+    assert text_one_hop.prediction == one_hop.prediction
+    assert text_one_hop.contacted_agent_ids == one_hop.contacted_agent_ids
+    assert text_one_hop.text_tokens > 0
+    assert text_one_hop.wire_bytes > 0
+    assert "Disease one" in text_one_hop.leaked_substrings
+    seen_text: list[str] = []
+    callback_result = run_medical_baseline(
+        episode,
+        graph,
+        agents,
+        MedicalBaselineKind.ONE_HOP,
+        max_rounds=2,
+        max_fanout=1,
+        channel="text",
+        text_aggregator=lambda summaries: (seen_text.extend(summaries) or "Disease zero"),
+    )
+    assert callback_result.prediction == "Disease zero"
+    assert seen_text
     assert flooding.prediction == "Disease zero"
     assert random_k.prediction == "Disease zero"
     assert heuristic.prediction == "Disease zero"

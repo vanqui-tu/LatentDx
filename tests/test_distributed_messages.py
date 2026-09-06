@@ -7,6 +7,10 @@ from medlatent.distributed import (
     MessageKind,
     ProposalPayload,
     RequestPayload,
+    TextChannel,
+    TextProposalPayload,
+    TextRequestPayload,
+    find_raw_substring_leaks,
 )
 
 
@@ -61,3 +65,22 @@ def test_evidence_payload_is_immutable():
 
     with pytest.raises(AttributeError):
         payload.score = 0.0
+
+
+def test_text_channel_round_trips_and_accounts_tokens_and_leaks():
+    payload = TextProposalPayload("Likely diagnosis: private-disease.", "private-disease", 0.8, 0.8)
+    channel = TextChannel(max_tokens=8, max_wire_bytes=256)
+
+    encoded = channel.encode(payload)
+    assert channel.decode(encoded) == payload
+    assert channel.cost(payload).logical_size == 3
+    assert find_raw_substring_leaks(payload.text, ("private-disease", "not-present")) == ("private-disease",)
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        TextChannel(max_tokens=2).encode(payload)
+
+
+def test_text_request_payload_is_typed_and_bounded():
+    channel = TextChannel(max_tokens=6)
+    payload = TextRequestPayload("Please return evidence.", (0, 2))
+    assert channel.decode(channel.encode(payload)) == payload
