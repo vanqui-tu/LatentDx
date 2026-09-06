@@ -5,12 +5,18 @@ from pathlib import Path
 import pytest
 
 from medlatent.distributed import (
+    CommunicationGraph,
+    MedicalBaselineKind,
+    MedicalEpisode,
+    MedicalQuery,
+    MedicalQueryRecord,
     SynchronousEpisodeEngine,
     build_medical_agents,
     load_hospital_private_stores,
     load_medical_dataset_splits,
     load_medical_split,
     path_graph,
+    run_medical_baseline,
     sample_balanced_sources,
 )
 
@@ -98,6 +104,66 @@ def test_medical_split_rejects_case_ids_shared_by_evaluation_splits(tmp_path: Pa
 
     with pytest.raises(ValueError, match="overlap"):
         load_medical_dataset_splits(train_file=train, validation_file=validation, test_file=test)
+
+
+def test_structured_medical_b0_to_b4_share_engine_and_emit_failure_stages(tmp_path: Path):
+    hospital_dir, embeddings, ic = _medical_files(tmp_path)
+    _write_json(hospital_dir / "hospital_2.json", [_row("h2-match", "HP:1", "Disease two")])
+    stores = load_hospital_private_stores(
+        hospital_dir,
+        num_agents=3,
+        hpo_embeddings_file=embeddings,
+        hpo_ic_file=ic,
+    )
+    agents = build_medical_agents(stores)
+    episode = MedicalEpisode("test", MedicalQuery("query", ("HP:1",), "phenotype query"), "Disease zero", 0)
+    graph = path_graph(3)
+
+    local = run_medical_baseline(episode, graph, agents, MedicalBaselineKind.LOCAL_ONLY, max_rounds=0, max_fanout=1)
+    one_hop = run_medical_baseline(episode, graph, agents, MedicalBaselineKind.ONE_HOP, max_rounds=2, max_fanout=1)
+    flooding = run_medical_baseline(episode, graph, agents, MedicalBaselineKind.FLOODING, max_rounds=4, max_fanout=2)
+    random_k = run_medical_baseline(episode, graph, agents, MedicalBaselineKind.RANDOM_K, max_rounds=4, max_fanout=2, seed=42)
+    heuristic = run_medical_baseline(
+        episode,
+        graph,
+        agents,
+        MedicalBaselineKind.HEURISTIC,
+        max_rounds=4,
+        max_fanout=2,
+        public_expertise={1: ("HP:1",), 2: ("HP:2",)},
+    )
+
+    assert local.prediction == "Disease zero"
+    assert one_hop.prediction == "Disease zero"
+    assert flooding.prediction == "Disease zero"
+    assert random_k.prediction == "Disease zero"
+    assert heuristic.prediction == "Disease zero"
+    assert all(not result.failure_stages for result in (local, one_hop, flooding, random_k, heuristic))
+    assert all(any(event.stage == "retrieval" for event in result.trace) for result in (local, one_hop, flooding, random_k, heuristic))
+    assert all(
+        graph.has_edge(event.agent_id, event.receiver_id)
+        for result in (one_hop, flooding, random_k, heuristic)
+        for event in result.episode.events
+        if event.event_type == "sent" and event.receiver_id is not None
+    )
+
+
+def test_medical_trace_marks_disconnected_topology_and_empty_retrieval(tmp_path: Path):
+    hospital_dir, embeddings, ic = _medical_files(tmp_path)
+    _write_json(hospital_dir / "hospital_2.json", [_row("h2-match", "HP:2", "Disease two")])
+    agents = build_medical_agents(
+        load_hospital_private_stores(
+            hospital_dir,
+            num_agents=3,
+            hpo_embeddings_file=embeddings,
+            hpo_ic_file=ic,
+        )
+    )
+    episode = MedicalEpisode("test", MedicalQuery("query", ("HP:missing",), "phenotype query"), "Target", 0)
+    disconnected = CommunicationGraph([[0, 0, 0], [0, 0, 0], [0, 0, 0]])
+    result = run_medical_baseline(episode, disconnected, agents, MedicalBaselineKind.ONE_HOP, max_rounds=1, max_fanout=1)
+
+    assert {event.stage for event in result.trace} >= {"unreachable", "routing", "retrieval", "aggregation"}
 
 
 def _write_split(tmp_path: Path, name: str, rows: list[dict[str, object]]) -> Path:

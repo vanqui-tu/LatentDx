@@ -3,6 +3,7 @@
 from .agent import AgentEpisodeState, AgentRuntime
 from .aggregation import AggregatedProposal, majority_vote, max_confidence, mean_score, require_all_evidence
 from .baselines import BaselineKind, BaselineResult, run_baseline
+from .medical_baselines import MedicalBaselineKind, MedicalBaselineResult, MedicalTraceEvent, run_medical_baseline
 from .channels import StructuredChannel
 from .config import DistributedBaselineConfig, TopologyConfig
 from .episode import EpisodeEvent, EpisodeResult, SynchronousEpisodeEngine
@@ -40,7 +41,7 @@ from .medical import (
     sample_balanced_sources,
 )
 from .store import PrivateKnowledgeStore, SyntheticKnowledgeRecord, SyntheticKnowledgeStore
-from .routing import DirectNeighborRouter, FloodUnvisitedRouter, RandomKRouter, Router
+from .routing import DirectNeighborRouter, FloodUnvisitedRouter, PublicExpertiseRouter, RandomKRouter, Router
 from .results import EpisodeLogRecord
 
 __all__ = [
@@ -50,6 +51,9 @@ __all__ = [
     "AgentRuntime",
     "BaselineKind",
     "BaselineResult",
+    "MedicalBaselineKind",
+    "MedicalBaselineResult",
+    "MedicalTraceEvent",
     "CommunicationCost",
     "CommunicationGraph",
     "ComplementaryEvidenceFixture",
@@ -75,6 +79,7 @@ __all__ = [
     "RandomKRouter",
     "DirectNeighborRouter",
     "FloodUnvisitedRouter",
+    "PublicExpertiseRouter",
     "StructuredChannel",
     "SynchronousEpisodeEngine",
     "SyntheticKnowledgeRecord",
@@ -95,5 +100,6 @@ __all__ = [
     "load_medical_split",
     "require_all_evidence",
     "run_baseline",
+    "run_medical_baseline",
     "sample_balanced_sources",
 ]

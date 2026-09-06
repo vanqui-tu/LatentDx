@@ -51,7 +51,7 @@ class DistributedBaselineConfig:
         _nonnegative_integer(self.max_fanout, "max_fanout")
         if self.source_policy not in {"fixed", "round_robin"}:
             raise ValueError("unknown source_policy")
-        if self.router not in {"direct_neighbor", "flood_unvisited"}:
+        if self.router not in {"direct_neighbor", "flood_unvisited", "random_k", "heuristic_expertise"}:
             raise ValueError("unknown router")
         if self.channel != "structured":
             raise ValueError("unknown channel")

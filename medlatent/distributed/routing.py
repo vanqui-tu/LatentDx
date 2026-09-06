@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 from random import Random
-from typing import Protocol, Sequence
+from typing import Mapping, Protocol, Sequence
 
 from .graph import CommunicationGraph
 
@@ -62,6 +62,32 @@ class RandomKRouter:
         seed_material = f"{self.seed}:{episode_id}:{round_index}:{sender_id}".encode("utf-8")
         rng = Random(int.from_bytes(sha256(seed_material).digest()[:8], "big"))
         return tuple(sorted(rng.sample(candidates, sample_size)))
+
+
+class PublicExpertiseRouter:
+    """Select legal neighbors by overlap with public expertise terms."""
+
+    def __init__(self, expertise: Mapping[int, Sequence[str]], query_terms: Sequence[str]) -> None:
+        self.expertise = {int(agent_id): frozenset(str(term) for term in terms) for agent_id, terms in expertise.items()}
+        self.query_terms = frozenset(str(term) for term in query_terms)
+
+    def select_neighbors(
+        self,
+        graph: CommunicationGraph,
+        sender_id: int,
+        *,
+        max_fanout: int,
+        excluded_agent_ids: Sequence[int] = (),
+        episode_id: str = "",
+        round_index: int = 0,
+    ) -> tuple[int, ...]:
+        candidates = _legal_neighbors(graph, sender_id, len(graph.neighbors(sender_id)), excluded_agent_ids)
+        return tuple(
+            sorted(
+                candidates,
+                key=lambda neighbor: (-len(self.query_terms.intersection(self.expertise.get(neighbor, ()))), neighbor),
+            )[: _fanout(max_fanout)]
+        )
 
 
 class FloodUnvisitedRouter(DirectNeighborRouter):
