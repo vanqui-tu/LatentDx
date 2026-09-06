@@ -4,6 +4,7 @@ from .agent import AgentEpisodeState, AgentRuntime
 from .aggregation import AggregatedProposal, majority_vote, max_confidence, mean_score, require_all_evidence
 from .baselines import BaselineKind, BaselineResult, run_baseline
 from .channels import StructuredChannel
+from .config import DistributedBaselineConfig, TopologyConfig
 from .episode import EpisodeEvent, EpisodeResult, SynchronousEpisodeEngine
 from .fixtures import ComplementaryEvidenceFixture, complementary_evidence_fixture
 from .graph import (
@@ -26,6 +27,7 @@ from .messages import (
 )
 from .store import PrivateKnowledgeStore, SyntheticKnowledgeRecord, SyntheticKnowledgeStore
 from .routing import DirectNeighborRouter, FloodUnvisitedRouter, RandomKRouter, Router
+from .results import EpisodeLogRecord
 
 __all__ = [
     "AckPayload",
@@ -38,8 +40,10 @@ __all__ = [
     "CommunicationGraph",
     "ComplementaryEvidenceFixture",
     "DegreeStatistics",
+    "DistributedBaselineConfig",
     "EpisodeEvent",
     "EpisodeResult",
+    "EpisodeLogRecord",
     "EvidencePayload",
     "MessageEnvelope",
     "MessageKind",
@@ -54,6 +58,7 @@ __all__ = [
     "SynchronousEpisodeEngine",
     "SyntheticKnowledgeRecord",
     "SyntheticKnowledgeStore",
+    "TopologyConfig",
     "complementary_evidence_fixture",
     "complete_graph",
     "path_graph",

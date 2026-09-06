@@ -190,7 +190,7 @@ def _message(
     kind: MessageKind,
     payload: RequestPayload | ProposalPayload,
 ) -> MessageEnvelope:
-    message_id = f"{episode_id}:{round_index}:{sender_id}:{receiver_id}:{kind.value}:{payload.to_dict()}"
+    message_id = f"{episode_id}:{round_index}:{sender_id}:{receiver_id}:{kind.value}"
     return MessageEnvelope.create(
         message_id=message_id,
         episode_id=episode_id,
