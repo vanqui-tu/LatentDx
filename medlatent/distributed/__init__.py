@@ -5,6 +5,8 @@ from .aggregation import AggregatedProposal, majority_vote, max_confidence, mean
 from .baselines import BaselineKind, BaselineResult, run_baseline
 from .medical_baselines import MedicalBaselineKind, MedicalBaselineResult, MedicalTraceEvent, run_medical_baseline
 from .textmas import TextGeneration, TextGenerator, TransformersTextGenerator, build_agent_prompt, build_host_prompt, parse_textmas_answer
+from .necessity import NecessityAuditReport, NecessityEpisodeAudit, audit_medical_necessity
+from .sweeps import SweepRecord, run_topology_budget_sweep
 from .channels import StructuredChannel, TextChannel, find_raw_substring_leaks
 from .config import DistributedBaselineConfig, TopologyConfig
 from .episode import EpisodeEvent, EpisodeResult, SynchronousEpisodeEngine
@@ -31,6 +33,7 @@ from .messages import (
 )
 from .medical import (
     HospitalPrivateStore,
+    EmptyPrivateStore,
     MedicalDatasetSplits,
     MedicalEpisode,
     MedicalQuery,
@@ -59,6 +62,9 @@ __all__ = [
     "MedicalTraceEvent",
     "TextGeneration",
     "TextGenerator",
+    "NecessityAuditReport",
+    "NecessityEpisodeAudit",
+    "SweepRecord",
     "TransformersTextGenerator",
     "CommunicationCost",
     "CommunicationGraph",
@@ -72,6 +78,7 @@ __all__ = [
     "MessageEnvelope",
     "MessageKind",
     "HospitalPrivateStore",
+    "EmptyPrivateStore",
     "MedicalDatasetSplits",
     "MedicalEpisode",
     "MedicalQuery",
@@ -114,5 +121,7 @@ __all__ = [
     "build_agent_prompt",
     "build_host_prompt",
     "parse_textmas_answer",
+    "audit_medical_necessity",
+    "run_topology_budget_sweep",
     "sample_balanced_sources",
 ]

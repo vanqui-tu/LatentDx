@@ -102,6 +102,15 @@ class HospitalPrivateStore(PrivateKnowledgeStore[MedicalRetrievedRecord]):
         return selected
 
 
+class EmptyPrivateStore(PrivateKnowledgeStore[MedicalRetrievedRecord]):
+    """Counterfactual store used to remove one agent's private evidence."""
+
+    def retrieve(self, query: object, *, limit: int | None = None) -> tuple[MedicalRetrievedRecord, ...]:
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be non-negative")
+        return ()
+
+
 @dataclass(frozen=True, slots=True)
 class MedicalDatasetSplits:
     train: tuple[MedicalQueryRecord, ...]
