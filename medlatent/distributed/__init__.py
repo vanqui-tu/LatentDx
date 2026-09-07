@@ -2,15 +2,10 @@
 
 from .agent import AgentEpisodeState, AgentRuntime
 from .aggregation import AggregatedProposal, majority_vote, max_confidence, mean_score, require_all_evidence
-from .baselines import BaselineKind, BaselineResult, run_baseline
 from .medical_baselines import MedicalBaselineKind, MedicalBaselineResult, MedicalTraceEvent, run_medical_baseline
 from .textmas import TextGeneration, TextGenerator, TransformersTextGenerator, build_agent_prompt, build_host_prompt, parse_textmas_answer
-from .necessity import NecessityAuditReport, NecessityEpisodeAudit, audit_medical_necessity
-from .sweeps import SweepRecord, run_topology_budget_sweep
 from .channels import StructuredChannel, TextChannel, find_raw_substring_leaks
-from .config import DistributedBaselineConfig, TopologyConfig
 from .episode import EpisodeEvent, EpisodeResult, SynchronousEpisodeEngine
-from .fixtures import ComplementaryEvidenceFixture, complementary_evidence_fixture
 from .graph import (
     CommunicationGraph,
     DegreeStatistics,
@@ -48,32 +43,23 @@ from .medical import (
 )
 from .store import PrivateKnowledgeStore, SyntheticKnowledgeRecord, SyntheticKnowledgeStore
 from .routing import DirectNeighborRouter, FloodUnvisitedRouter, PublicExpertiseRouter, RandomKRouter, Router
-from .results import EpisodeLogRecord
 
 __all__ = [
     "AckPayload",
     "AggregatedProposal",
     "AgentEpisodeState",
     "AgentRuntime",
-    "BaselineKind",
-    "BaselineResult",
     "MedicalBaselineKind",
     "MedicalBaselineResult",
     "MedicalTraceEvent",
     "TextGeneration",
     "TextGenerator",
-    "NecessityAuditReport",
-    "NecessityEpisodeAudit",
-    "SweepRecord",
     "TransformersTextGenerator",
     "CommunicationCost",
     "CommunicationGraph",
-    "ComplementaryEvidenceFixture",
     "DegreeStatistics",
-    "DistributedBaselineConfig",
     "EpisodeEvent",
     "EpisodeResult",
-    "EpisodeLogRecord",
     "EvidencePayload",
     "MessageEnvelope",
     "MessageKind",
@@ -101,8 +87,6 @@ __all__ = [
     "SynchronousEpisodeEngine",
     "SyntheticKnowledgeRecord",
     "SyntheticKnowledgeStore",
-    "TopologyConfig",
-    "complementary_evidence_fixture",
     "build_medical_agents",
     "complete_graph",
     "path_graph",
@@ -116,12 +100,9 @@ __all__ = [
     "load_medical_dataset_splits",
     "load_medical_split",
     "require_all_evidence",
-    "run_baseline",
     "run_medical_baseline",
     "build_agent_prompt",
     "build_host_prompt",
     "parse_textmas_answer",
-    "audit_medical_necessity",
-    "run_topology_budget_sweep",
     "sample_balanced_sources",
 ]
