@@ -23,11 +23,14 @@ def main() -> int:
     parser.add_argument("--hpo_ic_file", required=True, type=Path)
     parser.add_argument("--output_dir", required=True, type=Path)
     parser.add_argument("--agents", required=True, type=int)
-    parser.add_argument("--topologies", default="complete,ring,star,random_regular")
+    parser.add_argument("--topologies", default="complete,ring,star,path")
+    parser.add_argument("--source_seeds", default="42")
+    parser.add_argument("--node_assignment_seeds", default="0")
     parser.add_argument("--graph_seeds", default="42,43,44")
+    parser.add_argument("--routing_seeds", default="0")
     parser.add_argument("--rounds", default="1,2,4")
     parser.add_argument("--fanouts", default="1,2")
-    parser.add_argument("--random_regular_degree", type=int, default=2)
+    parser.add_argument("--random_regular_degree", type=int, default=3)
     parser.add_argument("--max_samples", type=int, default=-1)
     args = parser.parse_args()
 
@@ -45,7 +48,10 @@ def main() -> int:
         stores,
         num_agents=args.agents,
         topology_kinds=_csv(args.topologies),
+        source_seeds=_ints(args.source_seeds),
+        node_assignment_seeds=_ints(args.node_assignment_seeds),
         graph_seeds=_ints(args.graph_seeds),
+        routing_seeds=_ints(args.routing_seeds),
         rounds=_ints(args.rounds),
         fanouts=_ints(args.fanouts),
         random_regular_degree=args.random_regular_degree,
