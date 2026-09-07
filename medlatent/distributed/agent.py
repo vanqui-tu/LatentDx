@@ -4,10 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from numbers import Integral
-from typing import Any
+from typing import Any, Protocol, TypeVar
 
 from .messages import MessageEnvelope, MessageKind, ProposalPayload
-from .store import PrivateKnowledgeStore
+
+
+RecordT = TypeVar("RecordT", covariant=True)
+
+
+class PrivateKnowledgeStore(Protocol[RecordT]):
+    def retrieve(self, query: object, *, limit: int | None = None) -> tuple[RecordT, ...]:
+        ...
 
 
 @dataclass(slots=True)
@@ -20,7 +27,6 @@ class AgentEpisodeState:
     received_messages: list[MessageEnvelope] = field(default_factory=list)
     seen_message_ids: set[str] = field(default_factory=set)
     local_proposal: ProposalPayload | None = None
-    parent_message_id: str | None = None
     parent_agent_id: int | None = None
     active: bool = False
     processing: bool = False
@@ -32,12 +38,11 @@ class AgentEpisodeState:
             raise ValueError("message receiver does not match state owner")
         if message.message_id in self.seen_message_ids:
             return False
-        if message.kind is MessageKind.REQUEST and self.parent_message_id is not None:
+        if message.kind is MessageKind.REQUEST and self.parent_agent_id is not None:
             return False
         self.seen_message_ids.add(message.message_id)
         self.next_inbox.append(message)
-        if message.kind is MessageKind.REQUEST and self.parent_message_id is None:
-            self.parent_message_id = message.message_id
+        if message.kind is MessageKind.REQUEST and self.parent_agent_id is None:
             self.parent_agent_id = message.sender_id
         self.active = True
         return True
@@ -63,8 +68,6 @@ class AgentRuntime:
     def __init__(self, agent_id: int, store: PrivateKnowledgeStore[Any]) -> None:
         if isinstance(agent_id, bool) or not isinstance(agent_id, Integral) or agent_id < 0:
             raise ValueError("agent_id must be a non-negative integer")
-        if not isinstance(store, PrivateKnowledgeStore):
-            raise TypeError("store must implement PrivateKnowledgeStore")
         self._agent_id = int(agent_id)
         self.__store = store
         self._states: dict[str, AgentEpisodeState] = {}

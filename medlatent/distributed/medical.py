@@ -9,8 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .agent import AgentRuntime
-from .store import PrivateKnowledgeStore
+from .agent import AgentRuntime, PrivateKnowledgeStore
 from ..retrieval import HpoCosineRetriever
 
 
@@ -100,15 +99,6 @@ class HospitalPrivateStore(PrivateKnowledgeStore[MedicalRetrievedRecord]):
         selected = matches if limit is None else matches[:limit]
         self.__retrieval_events.append(RetrievalAuditEvent(self._agent_id, case_id, len(selected)))
         return selected
-
-
-class EmptyPrivateStore(PrivateKnowledgeStore[MedicalRetrievedRecord]):
-    """Counterfactual store used to remove one agent's private evidence."""
-
-    def retrieve(self, query: object, *, limit: int | None = None) -> tuple[MedicalRetrievedRecord, ...]:
-        if limit is not None and limit < 0:
-            raise ValueError("limit must be non-negative")
-        return ()
 
 
 @dataclass(frozen=True, slots=True)

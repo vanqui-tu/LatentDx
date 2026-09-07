@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from numbers import Integral
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
@@ -90,7 +90,7 @@ class SynchronousEpisodeEngine:
                             agent_id=agent_id,
                             message_id=message.message_id,
                             receiver_id=agent_id,
-                            wire_bytes=message.cost.wire_bytes,
+                            wire_bytes=message.wire_bytes,
                         )
                     )
                 if state.active:
@@ -147,8 +147,7 @@ class SynchronousEpisodeEngine:
 
         for message in valid_outgoing:
             sent_message_ids.add(message.message_id)
-            delivered = replace(message, ttl=message.ttl - 1)
-            accepted = states[message.receiver_id].queue_for_next_round(delivered)
+            accepted = states[message.receiver_id].queue_for_next_round(message)
             events.append(
                 EpisodeEvent(
                     round_index=round_index,
@@ -156,7 +155,7 @@ class SynchronousEpisodeEngine:
                     agent_id=sender_id,
                     message_id=message.message_id,
                     receiver_id=message.receiver_id,
-                    wire_bytes=message.cost.wire_bytes,
+                    wire_bytes=message.wire_bytes,
                 )
             )
 
@@ -173,8 +172,6 @@ class SynchronousEpisodeEngine:
             raise ValueError("message round_sent does not match current round")
         if message.sender_id != sender_id:
             raise ValueError("message sender does not match active agent")
-        if message.ttl <= 0:
-            raise ValueError("message TTL is exhausted")
         if not self.graph.has_edge(sender_id, message.receiver_id):
             raise ValueError("message receiver is not a graph neighbor")
 

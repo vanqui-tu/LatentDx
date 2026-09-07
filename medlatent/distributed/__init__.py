@@ -1,108 +1,27 @@
-"""Distributed communication primitives for private-knowledge diagnosis."""
+"""Lean distributed communication runtime for the M2 medical baseline."""
 
-from .agent import AgentEpisodeState, AgentRuntime
-from .aggregation import AggregatedProposal, majority_vote, max_confidence, mean_score, require_all_evidence
-from .medical_baselines import MedicalBaselineKind, MedicalBaselineResult, MedicalTraceEvent, run_medical_baseline
-from .textmas import TextGeneration, TextGenerator, TransformersTextGenerator, build_agent_prompt, build_host_prompt, parse_textmas_answer
-from .channels import StructuredChannel, TextChannel, find_raw_substring_leaks
+from .agent import AgentEpisodeState, AgentRuntime, PrivateKnowledgeStore
+from .channels import StructuredChannel, TextChannel
 from .episode import EpisodeEvent, EpisodeResult, SynchronousEpisodeEngine
-from .graph import (
-    CommunicationGraph,
-    DegreeStatistics,
-    complete_graph,
-    path_graph,
-    random_regular_graph,
-    ring_graph,
-    star_graph,
-)
-from .messages import (
-    AckPayload,
-    CommunicationCost,
-    EvidencePayload,
-    MessageEnvelope,
-    MessageKind,
-    ProposalPayload,
-    RequestPayload,
-    TextProposalPayload,
-    TextRequestPayload,
-)
+from .graph import CommunicationGraph, complete_graph, path_graph, ring_graph
 from .medical import (
-    HospitalPrivateStore,
-    EmptyPrivateStore,
-    MedicalDatasetSplits,
-    MedicalEpisode,
-    MedicalQuery,
-    MedicalQueryRecord,
-    MedicalRetrievedRecord,
-    RetrievalAuditEvent,
-    build_medical_agents,
-    load_hospital_private_stores,
-    load_medical_dataset_splits,
-    load_medical_split,
-    sample_balanced_sources,
+    HospitalPrivateStore, MedicalDatasetSplits, MedicalEpisode,
+    MedicalQuery, MedicalQueryRecord, MedicalRetrievedRecord, RetrievalAuditEvent,
+    build_medical_agents, load_hospital_private_stores, load_medical_dataset_splits,
+    load_medical_split, sample_balanced_sources,
 )
-from .store import PrivateKnowledgeStore, SyntheticKnowledgeRecord, SyntheticKnowledgeStore
-from .routing import DirectNeighborRouter, FloodUnvisitedRouter, PublicExpertiseRouter, RandomKRouter, Router
+from .medical_baselines import MedicalBaselineKind, MedicalBaselineResult, run_medical_baseline
+from .messages import MessageEnvelope, MessageKind, ProposalPayload, RequestPayload, TextProposalPayload, TextRequestPayload
+from .textmas import TextGeneration, TextGenerator, TransformersTextGenerator, build_agent_prompt, build_host_prompt, parse_textmas_answer
 
 __all__ = [
-    "AckPayload",
-    "AggregatedProposal",
-    "AgentEpisodeState",
-    "AgentRuntime",
-    "MedicalBaselineKind",
-    "MedicalBaselineResult",
-    "MedicalTraceEvent",
-    "TextGeneration",
-    "TextGenerator",
-    "TransformersTextGenerator",
-    "CommunicationCost",
-    "CommunicationGraph",
-    "DegreeStatistics",
-    "EpisodeEvent",
-    "EpisodeResult",
-    "EvidencePayload",
-    "MessageEnvelope",
-    "MessageKind",
-    "HospitalPrivateStore",
-    "EmptyPrivateStore",
-    "MedicalDatasetSplits",
-    "MedicalEpisode",
-    "MedicalQuery",
-    "MedicalQueryRecord",
-    "MedicalRetrievedRecord",
-    "PrivateKnowledgeStore",
-    "ProposalPayload",
-    "RequestPayload",
-    "Router",
-    "RetrievalAuditEvent",
-    "RandomKRouter",
-    "DirectNeighborRouter",
-    "FloodUnvisitedRouter",
-    "PublicExpertiseRouter",
-    "StructuredChannel",
-    "TextChannel",
-    "TextProposalPayload",
-    "TextRequestPayload",
-    "find_raw_substring_leaks",
-    "SynchronousEpisodeEngine",
-    "SyntheticKnowledgeRecord",
-    "SyntheticKnowledgeStore",
-    "build_medical_agents",
-    "complete_graph",
-    "path_graph",
-    "random_regular_graph",
-    "ring_graph",
-    "star_graph",
-    "majority_vote",
-    "max_confidence",
-    "mean_score",
-    "load_hospital_private_stores",
-    "load_medical_dataset_splits",
-    "load_medical_split",
-    "require_all_evidence",
-    "run_medical_baseline",
-    "build_agent_prompt",
-    "build_host_prompt",
-    "parse_textmas_answer",
-    "sample_balanced_sources",
+    "AgentEpisodeState", "AgentRuntime", "PrivateKnowledgeStore",
+    "CommunicationGraph", "complete_graph", "path_graph", "ring_graph",
+    "MessageEnvelope", "MessageKind", "ProposalPayload", "RequestPayload", "TextProposalPayload", "TextRequestPayload",
+    "EpisodeEvent", "EpisodeResult", "SynchronousEpisodeEngine", "StructuredChannel", "TextChannel",
+    "HospitalPrivateStore", "MedicalDatasetSplits", "MedicalEpisode", "MedicalQuery", "MedicalQueryRecord",
+    "MedicalRetrievedRecord", "RetrievalAuditEvent", "build_medical_agents", "load_hospital_private_stores",
+    "load_medical_dataset_splits", "load_medical_split", "sample_balanced_sources",
+    "MedicalBaselineKind", "MedicalBaselineResult", "run_medical_baseline",
+    "TextGeneration", "TextGenerator", "TransformersTextGenerator", "build_agent_prompt", "build_host_prompt", "parse_textmas_answer",
 ]
