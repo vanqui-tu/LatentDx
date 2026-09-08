@@ -27,6 +27,7 @@ from medlatent.distributed import (  # noqa: E402
     load_hospital_private_stores,
     load_medical_split,
     path_graph,
+    prediction_matches_target,
     ring_graph,
     run_medical_baseline,
     sample_balanced_sources,
@@ -144,12 +145,13 @@ def _seed_everything(seed: int, *, deterministic: bool) -> None:
 
 
 def _summary(rows: list[dict[str, object]], episodes: tuple, stores: dict, methods: tuple[MedicalBaselineKind, ...]) -> dict[str, object]:
+    episode_by_case_id = {episode.query.case_id: episode for episode in episodes}
     method_summary: dict[str, dict[str, float]] = {}
     for method in (kind.value for kind in methods):
         method_rows = [row for row in rows if row["method"] == method]
         count = len(method_rows)
         method_summary[method] = {
-            "accuracy": sum(row["prediction"] == row["target"] for row in method_rows) / count,
+            "accuracy": sum(prediction_matches_target(row["prediction"], episode_by_case_id[row["case_id"]]) for row in method_rows) / count,
             "mean_messages": sum(int(row["messages"]) for row in method_rows) / count,
             "mean_bytes": sum(int(row["wire_bytes"]) for row in method_rows) / count,
         }
@@ -166,7 +168,7 @@ def _retrieval_coverage(episodes: tuple, stores: dict) -> dict[str, float]:
         gold_agents = {
             agent_id
             for agent_id, store in stores.items()
-            if (records := store.retrieve(episode.query, limit=1)) and records[0].label == episode.target_label
+            if (records := store.retrieve(episode.query, limit=1)) and prediction_matches_target(records[0].label, episode)
         }
         source_local += episode.source_id in gold_agents
         remote += bool(gold_agents.difference({episode.source_id}))
@@ -185,6 +187,7 @@ def _manifest(args: argparse.Namespace, graph) -> dict[str, object]:
         "git_commit": _git_commit(),
         "channel": args.channel,
         "model_name": args.model_name,
+        "target_match_rule": "casefolded punctuation-insensitive match against target_label or disease_aliases",
         "methods": args.methods,
         "seed": args.seed,
         "deterministic": args.deterministic,

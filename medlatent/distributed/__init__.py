@@ -8,7 +8,7 @@ from .medical import (
     HospitalPrivateStore, MedicalDatasetSplits, MedicalEpisode,
     MedicalQuery, MedicalQueryRecord, MedicalRetrievedRecord, RetrievalAuditEvent,
     build_medical_agents, load_hospital_private_stores, load_medical_dataset_splits,
-    load_medical_split, sample_balanced_sources,
+    load_medical_split, prediction_matches_target, sample_balanced_sources,
 )
 from .medical_baselines import MedicalBaselineKind, MedicalBaselineResult, run_medical_baseline
 from .messages import MessageEnvelope, MessageKind, ProposalPayload, RequestPayload, TextProposalPayload, TextRequestPayload
@@ -21,7 +21,7 @@ __all__ = [
     "EpisodeEvent", "EpisodeResult", "SynchronousEpisodeEngine", "StructuredChannel", "TextChannel",
     "HospitalPrivateStore", "MedicalDatasetSplits", "MedicalEpisode", "MedicalQuery", "MedicalQueryRecord",
     "MedicalRetrievedRecord", "RetrievalAuditEvent", "build_medical_agents", "load_hospital_private_stores",
-    "load_medical_dataset_splits", "load_medical_split", "sample_balanced_sources",
+    "load_medical_dataset_splits", "load_medical_split", "prediction_matches_target", "sample_balanced_sources",
     "MedicalBaselineKind", "MedicalBaselineResult", "run_medical_baseline",
     "TextGeneration", "TextGenerator", "TransformersTextGenerator", "build_agent_prompt", "build_host_prompt", "parse_textmas_answer",
 ]

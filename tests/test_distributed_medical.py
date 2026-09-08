@@ -3,7 +3,7 @@ from pathlib import Path
 
 from medlatent.distributed import (
     MedicalBaselineKind, MedicalEpisode, MedicalQuery, build_medical_agents,
-    TextGeneration, load_hospital_private_stores, path_graph, run_medical_baseline,
+    TextGeneration, load_hospital_private_stores, path_graph, prediction_matches_target, run_medical_baseline,
 )
 
 
@@ -61,3 +61,16 @@ def test_text_baseline_uses_same_route_and_fake_aggregation(tmp_path):
     assert result.prediction == "Disease 0"
     assert result.text_tokens > 0
     assert result.text_prompt_tokens > 0
+
+
+def test_target_aliases_make_evaluation_language_and_format_insensitive():
+    episode = MedicalEpisode(
+        "test",
+        MedicalQuery("query", ("HP:1",), "phenotype"),
+        "Noonan 综合征",
+        0,
+        ("Noonan syndrome", "Noonan syndrome 1"),
+    )
+
+    assert prediction_matches_target("NOONAN-SYNDROME", episode)
+    assert not prediction_matches_target("Costello syndrome", episode)

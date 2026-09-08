@@ -21,7 +21,9 @@ git rev-parse HEAD
 ```
 
 Every run writes `episodes.jsonl`, `summary.json`, and `run.json`. The manifest
-records the command, Git commit, graph, seed, input hashes, and library versions.
+records the command, Git commit, graph, seed, input hashes, library versions,
+and evaluation rule. Accuracy accepts the canonical disease label or any declared
+`disease_aliases` entry after case-folding and punctuation normalization.
 
 ## Structured Canonical Run
 

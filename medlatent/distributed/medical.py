@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -24,6 +25,7 @@ class MedicalQuery:
 class MedicalQueryRecord:
     query: MedicalQuery
     target_label: str
+    target_aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +34,7 @@ class MedicalEpisode:
     query: MedicalQuery
     target_label: str
     source_id: int
+    target_aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +152,7 @@ def load_medical_split(path: str | Path) -> tuple[MedicalQueryRecord, ...]:
                 phenotype_text=_phenotype_text(row),
             ),
             target_label=_disease_name(row),
+            target_aliases=_disease_aliases(row),
         )
         for index, row in enumerate(_read_json_list(path))
     )
@@ -195,7 +199,13 @@ def sample_balanced_sources(
     random.Random(seed).shuffle(ordered_ids)
     source_by_case_id = {case_id: index % num_agents for index, case_id in enumerate(ordered_ids)}
     return tuple(
-        MedicalEpisode(split, record.query, record.target_label, source_by_case_id[record.query.case_id])
+        MedicalEpisode(
+            split,
+            record.query,
+            record.target_label,
+            source_by_case_id[record.query.case_id],
+            record.target_aliases,
+        )
         for record in records
     )
 
@@ -256,6 +266,26 @@ def _disease_name(row: Mapping[str, object]) -> str:
     if isinstance(codes, Sequence) and not isinstance(codes, str) and codes:
         return str(codes[0])
     return "Unknown disease"
+
+
+def prediction_matches_target(prediction: str | None, episode: MedicalEpisode) -> bool:
+    """Return whether a prediction equals the canonical target or one declared alias."""
+
+    if prediction is None:
+        return False
+    accepted = (episode.target_label, *episode.target_aliases)
+    return _normalize_disease_name(prediction) in {_normalize_disease_name(label) for label in accepted}
+
+
+def _disease_aliases(row: Mapping[str, object]) -> tuple[str, ...]:
+    values = row.get("disease_aliases", ())
+    if not isinstance(values, Sequence) or isinstance(values, str):
+        return ()
+    return tuple(dict.fromkeys(str(value) for value in values if str(value).strip()))
+
+
+def _normalize_disease_name(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", value.casefold())).strip()
 
 
 def _query_fields(query: object) -> tuple[tuple[str, ...], str]:
