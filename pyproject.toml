@@ -16,6 +16,9 @@ dependencies = [
   "flash-attn"
 ]
 
+[project.optional-dependencies]
+graphs = ["networkx>=3.0"]
+
 [tool.setuptools.packages.find]
 include = ["medlatent*"]
 

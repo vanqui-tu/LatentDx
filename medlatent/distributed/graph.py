@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from numbers import Integral
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -98,6 +98,87 @@ def ring_graph(num_agents: int) -> CommunicationGraph:
     adjacency[0, -1] = True
     adjacency[-1, 0] = True
     return CommunicationGraph(adjacency)
+
+
+def erdos_renyi_graph(num_agents: int, edge_probability: float, *, seed: int, connectivity: str = "allow_disconnected") -> CommunicationGraph:
+    """Build a seeded Erdos-Renyi graph using optional NetworkX."""
+    count = _num_agents(num_agents)
+    probability = _probability(edge_probability, "edge_probability")
+    _connectivity_policy(connectivity)
+    network = _networkx().gnp_random_graph(count, probability, seed=_nonnegative(seed, "seed"))
+    return _from_networkx(network, connectivity)
+
+
+def watts_strogatz_graph(num_agents: int, nearest_neighbors: int, rewiring_probability: float, *, seed: int, connectivity: str = "allow_disconnected") -> CommunicationGraph:
+    """Build a seeded Watts-Strogatz graph using optional NetworkX."""
+    count = _num_agents(num_agents)
+    neighbors = _nonnegative(nearest_neighbors, "nearest_neighbors")
+    if neighbors >= count or neighbors % 2:
+        raise ValueError("nearest_neighbors must be an even value smaller than num_agents")
+    probability = _probability(rewiring_probability, "rewiring_probability")
+    _connectivity_policy(connectivity)
+    network = _networkx().watts_strogatz_graph(count, neighbors, probability, seed=_nonnegative(seed, "seed"))
+    return _from_networkx(network, connectivity)
+
+
+def stochastic_block_model_graph(block_sizes: Sequence[int], edge_probabilities: Sequence[Sequence[float]], *, seed: int, connectivity: str = "allow_disconnected") -> CommunicationGraph:
+    """Build a seeded undirected stochastic block model graph."""
+    if isinstance(block_sizes, (str, bytes)) or not block_sizes:
+        raise ValueError("block_sizes must be a non-empty sequence")
+    sizes = [_num_agents(size) for size in block_sizes]
+    probabilities = np.asarray(edge_probabilities, dtype=float)
+    block_count = len(sizes)
+    if probabilities.shape != (block_count, block_count):
+        raise ValueError("edge_probabilities must be square with one row per block")
+    if not np.array_equal(probabilities, probabilities.T):
+        raise ValueError("edge_probabilities must be symmetric")
+    if not np.all((0.0 <= probabilities) & (probabilities <= 1.0)):
+        raise ValueError("edge_probabilities must be between 0 and 1")
+    _connectivity_policy(connectivity)
+    network = _networkx().stochastic_block_model(sizes, probabilities.tolist(), seed=_nonnegative(seed, "seed"))
+    return _from_networkx(network, connectivity)
+
+
+def _networkx() -> Any:
+    try:
+        import networkx as nx
+    except ImportError as error:
+        raise RuntimeError("networkx is required for optional graph generators; install medlatent[graphs]") from error
+    return nx
+
+
+def _from_networkx(network: Any, connectivity: str) -> CommunicationGraph:
+    graph = CommunicationGraph(_networkx().to_numpy_array(network, nodelist=range(len(network)), dtype=np.bool_))
+    if connectivity == "connected" and not _is_connected(graph):
+        raise ValueError("generated graph is disconnected under connectivity='connected'")
+    return graph
+
+
+def _is_connected(graph: CommunicationGraph) -> bool:
+    reached, frontier = {0}, [0]
+    while frontier:
+        for neighbor in graph.neighbors(frontier.pop()):
+            if neighbor not in reached:
+                reached.add(neighbor)
+                frontier.append(neighbor)
+    return len(reached) == graph.num_agents
+
+
+def _connectivity_policy(value: str) -> None:
+    if value not in {"connected", "allow_disconnected"}:
+        raise ValueError("connectivity must be 'connected' or 'allow_disconnected'")
+
+
+def _nonnegative(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return int(value)
+
+
+def _probability(value: float, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")
+    return float(value)
 
 
 def _num_agents(value: int) -> int:
