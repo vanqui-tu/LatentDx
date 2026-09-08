@@ -9,6 +9,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 from ..prompts import TEXTMAS_SYSTEM_PROMPT
 from .agent import AgentEpisodeState, AgentRuntime
+from .channels import TextChannel
 from .episode import EpisodeResult, SynchronousEpisodeEngine
 from .graph import CommunicationGraph
 from .medical import MedicalEpisode
@@ -47,6 +48,7 @@ def run_medical_baseline(
     max_fanout: int,
     channel: str = "structured",
     max_text_tokens: int = 128,
+    max_text_wire_bytes: int = 4_096,
     text_aggregator: Callable[[tuple[str, ...]], str | None] | None = None,
     text_generator: TextGenerator | None = None,
     max_text_completion_tokens: int = 128,
@@ -58,6 +60,7 @@ def run_medical_baseline(
         raise ValueError("channel must be structured or text")
     if max_text_tokens <= 0:
         raise ValueError("max_text_tokens must be positive")
+    text_channel = TextChannel(max_tokens=max_text_tokens, max_wire_bytes=max_text_wire_bytes) if channel == "text" else None
     episode_id = episode_id or f"medical:{episode.split}:{episode.query.case_id}:{kind.value}:{channel}"
     local_proposals: list[ProposalPayload] = []
     local_texts: list[str] = []
@@ -92,7 +95,10 @@ def run_medical_baseline(
                 if message.kind is MessageKind.PROPOSAL and message.sender_id != state.parent_agent_id:
                     outgoing.append(_proposal(episode_id, round_index, agent.agent_id, state.parent_agent_id, message.payload))
         state.deactivate()
-        _validate_text(outgoing, max_text_tokens)
+        if text_channel is not None:
+            for message in outgoing:
+                if isinstance(message.payload, (TextRequestPayload, TextProposalPayload)):
+                    text_channel.wire_bytes(message.payload)
         text_tokens += sum(
             _text_tokens(message.payload.text)
             for message in outgoing
@@ -210,15 +216,6 @@ def _structured(payload: Proposal) -> ProposalPayload:
 def _visited(payload: object) -> tuple[int, ...]:
     assert isinstance(payload, (RequestPayload, TextRequestPayload))
     return payload.visited_agent_ids
-
-
-def _validate_text(messages: Sequence[MessageEnvelope], max_tokens: int) -> None:
-    if any(
-        _text_tokens(message.payload.text) > max_tokens
-        for message in messages
-        if isinstance(message.payload, (TextRequestPayload, TextProposalPayload))
-    ):
-        raise ValueError("text payload exceeds max_text_tokens")
 
 
 def _text_tokens(text: str) -> int:

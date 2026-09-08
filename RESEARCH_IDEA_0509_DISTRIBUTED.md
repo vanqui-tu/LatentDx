@@ -1,6 +1,6 @@
 # Distributed Communication for Private-Knowledge Diagnosis
 
-> Working research and implementation plan. Last updated: 2026-09-07.
+> Working research and implementation plan. Last updated: 2026-09-08.
 >
 > Current scope: Phase 1 supports fixed, simple, undirected graphs only.
 > Directed graphs, dynamic topology, node churn, and network failures are
@@ -763,3 +763,4 @@ notes rather than expanding this table indefinitely.
 | 2026-09-07 | Lean scope reset | M2L1-M2L3 | Documentation only | Prune framework code across `bd5d825`, then run one fixed setting |
 | 2026-09-07 | Deep foundation prune review | M2L1 | `bd5d825` dependency/line audit; no runtime code changed | Treat the commit as behavioral reference; target eight core modules and one runner |
 | 2026-09-07 | Lean M2 runtime reduction | M2L1 | `DecentralizedMAS`: `python -m pytest -q` (19 passed); one-case structured `run_distributed_medical.py` smoke | Removed retired layers and APIs; canonical runner is ready for M2L2 |
+| 2026-09-08 | GPU-runner preparation | M2L2, M2L3 | `DecentralizedMAS`: 19 tests passed; two real skewed cases passed for canonical, path, and complete settings; repeated structured artifacts were identical | Runner now records reproducibility metadata; [distributed M2 commands](docs/distributed_m2.md) are ready for the external instance |
