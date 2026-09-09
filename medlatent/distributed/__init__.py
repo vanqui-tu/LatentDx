@@ -12,7 +12,7 @@ from .medical import (
 )
 from .medical_baselines import MedicalBaselineKind, MedicalBaselineResult, run_medical_baseline
 from .messages import MessageEnvelope, MessageKind, ProposalPayload, RequestPayload, TextProposalPayload, TextRequestPayload
-from .textmas import TextGeneration, TextGenerator, TransformersTextGenerator, build_agent_prompt, build_host_prompt, parse_textmas_answer
+from .textmas import TextGeneration, TextGenerator, TransformersTextGenerator, VllmTextGenerator, build_agent_prompt, build_host_prompt, parse_textmas_answer
 
 __all__ = [
     "AgentEpisodeState", "AgentRuntime", "PrivateKnowledgeStore",
@@ -23,5 +23,5 @@ __all__ = [
     "MedicalRetrievedRecord", "RetrievalAuditEvent", "build_medical_agents", "load_hospital_private_stores",
     "load_medical_dataset_splits", "load_medical_split", "prediction_matches_target", "sample_balanced_sources",
     "MedicalBaselineKind", "MedicalBaselineResult", "run_medical_baseline",
-    "TextGeneration", "TextGenerator", "TransformersTextGenerator", "build_agent_prompt", "build_host_prompt", "parse_textmas_answer",
+    "TextGeneration", "TextGenerator", "TransformersTextGenerator", "VllmTextGenerator", "build_agent_prompt", "build_host_prompt", "parse_textmas_answer",
 ]

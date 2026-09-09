@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 from typing import Protocol
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 from ..prompts import TEXTMAS_SYSTEM_PROMPT, build_textmas_agent_prompt, build_textmas_host_prompt
 
@@ -73,6 +76,74 @@ class TransformersTextGenerator:
             prompt_tokens=int(encoded["input_ids"].shape[1]),
             completion_tokens=int(generated_ids.shape[0]),
         )
+
+
+class VllmTextGenerator:
+    """OpenAI-compatible vLLM chat-completions adapter.
+
+    The server owns model loading and GPU placement. This adapter is only used
+    when the runner is given ``--vllm_base_url``; Transformers remains the
+    default local backend.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        base_url: str = "http://127.0.0.1:8000",
+    ) -> None:
+        if not model_name:
+            raise ValueError("model_name must not be empty")
+        if not base_url.startswith(("http://", "https://")):
+            raise ValueError("base_url must start with http:// or https://")
+        self.model_name = model_name
+        self.base_url = base_url.rstrip("/")
+
+    def generate(self, system_prompt: str, user_prompt: str, *, max_new_tokens: int) -> TextGeneration:
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "max_tokens": max_new_tokens,
+            "seed": 42,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        headers = {"Content-Type": "application/json"}
+        request = urlrequest.Request(
+            self._endpoint(),
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urlrequest.urlopen(request, timeout=300.0) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except (urlerror.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"vLLM request failed at {self._endpoint()}: {exc}") from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("vLLM returned invalid JSON") from exc
+        if "error" in body:
+            raise RuntimeError(f"vLLM error: {body['error']}")
+        try:
+            text = body["choices"][0]["message"]["content"]
+            usage = body.get("usage") or {}
+            return TextGeneration(
+                text=str(text).strip(),
+                prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                completion_tokens=int(usage.get("completion_tokens", 0)),
+            )
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError("vLLM response has no valid chat completion") from exc
+
+    def _endpoint(self) -> str:
+        suffix = "/v1/chat/completions"
+        return self.base_url if self.base_url.endswith(suffix) else f"{self.base_url}{suffix}"
 
 
 def build_agent_prompt(*, hospital_id: int, case_disease: str, case_phenotype: str, test_phenotype: str) -> str:

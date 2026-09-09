@@ -81,6 +81,19 @@ python scripts/run_distributed_medical.py \
 Pin a local Hugging Face model path or an immutable revision before running this.
 Greedy decoding and deterministic PyTorch mode are enabled by default.
 
+For a separate GPU server, vLLM is supported through its OpenAI-compatible
+`/v1/chat/completions` endpoint. Start the server (the model name must match the
+served model ID):
+
+```bash
+vllm serve Qwen/Qwen3-4B-Instruct-2507 --host 0.0.0.0 --port 8000
+```
+
+Then pass `--vllm_base_url http://127.0.0.1:8000` to the text runner. This path
+does not import or initialize a local Transformers model; structured runs are
+unchanged. Thinking is disabled by default so the returned text follows the
+same bounded-summary contract as the local adapter.
+
 ```bash
 python scripts/run_distributed_medical.py \
   --hospital_dir data_original_skewed \
@@ -100,6 +113,23 @@ python scripts/run_distributed_medical.py \
   --max_fanout 2 \
   --device cuda \
   --dtype bfloat16
+
+python scripts/run_distributed_medical.py \
+  --hospital_dir data_original_skewed \
+  --split_file data_original_skewed/test.json \
+  --hpo_embeddings_file data/hpo_embeddings.json.gz \
+  --hpo_ic_file data/hpo_ic.json \
+  --output_dir outputs/distributed_m2/text_vllm_b2_first50 \
+  --channel text \
+  --model_name Qwen/Qwen3-4B-Instruct-2507 \
+  --vllm_base_url http://127.0.0.1:8000 \
+  --max_samples 50 \
+  --methods B2 \
+  --seed 42 \
+  --num_agents 5 \
+  --topology ring \
+  --rounds 4 \
+  --max_fanout 2
 
 python scripts/run_distributed_medical.py \
   --hospital_dir data_original_skewed \

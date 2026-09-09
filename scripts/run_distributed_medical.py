@@ -22,6 +22,7 @@ if __package__ in {None, ""}:
 from medlatent.distributed import (  # noqa: E402
     MedicalBaselineKind,
     TransformersTextGenerator,
+    VllmTextGenerator,
     build_medical_agents,
     complete_graph,
     load_hospital_private_stores,
@@ -44,6 +45,7 @@ def main() -> int:
     parser.add_argument("--channel", choices=("structured", "text"), default="structured")
     parser.add_argument("--methods", choices=tuple(kind.value for kind in MedicalBaselineKind), nargs="+", default=[kind.value for kind in MedicalBaselineKind])
     parser.add_argument("--model_name")
+    parser.add_argument("--vllm_base_url")
     parser.add_argument("--max_samples", type=int)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_agents", type=int, default=5)
@@ -74,7 +76,12 @@ def main() -> int:
         records = records[:args.max_samples]
     episodes = sample_balanced_sources(records, split=args.split_file.stem, num_agents=args.num_agents, seed=args.seed)
     generator = (
-        TransformersTextGenerator(args.model_name, device=args.device, dtype_name=args.dtype, local_files_only=args.local_files_only)
+        VllmTextGenerator(
+            args.model_name,
+            base_url=args.vllm_base_url,
+        )
+        if args.channel == "text" and args.vllm_base_url
+        else TransformersTextGenerator(args.model_name, device=args.device, dtype_name=args.dtype, local_files_only=args.local_files_only)
         if args.channel == "text"
         else None
     )
@@ -118,6 +125,8 @@ def main() -> int:
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.channel == "text" and not args.model_name:
         parser.error("--model_name is required when --channel text")
+    if args.vllm_base_url and args.channel != "text":
+        parser.error("--vllm_base_url requires --channel text")
     for name in ("num_agents", "rounds", "max_fanout", "max_text_tokens", "max_text_wire_bytes", "max_new_tokens"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name} must be positive")
@@ -187,6 +196,8 @@ def _manifest(args: argparse.Namespace, graph) -> dict[str, object]:
         "git_commit": _git_commit(),
         "channel": args.channel,
         "model_name": args.model_name,
+        "text_backend": "vllm" if args.vllm_base_url else ("transformers" if args.channel == "text" else None),
+        "vllm_base_url": args.vllm_base_url,
         "target_match_rule": "casefolded punctuation-insensitive match against target_label or disease_aliases",
         "methods": args.methods,
         "seed": args.seed,

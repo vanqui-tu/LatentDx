@@ -1,6 +1,6 @@
 # Distributed Communication for Private-Knowledge Diagnosis
 
-> Working research and implementation plan. Last updated: 2026-09-08.
+> Working research and implementation plan. Last updated: 2026-09-09.
 >
 > Current scope: Phase 1 supports fixed, simple, undirected graphs only.
 > Directed graphs, dynamic topology, node churn, and network failures are
@@ -382,7 +382,11 @@ Run only these comparisons:
 For TextMAS, start with the first fixed 50 cases from the same ordered test
 split and one frozen model. Expand to 401 only if the pilot changes conclusions
 and runtime is acceptable. Hugging Face `transformers` remains the reference
-backend because the latent path will need its hidden states/KV cache. Load the
+backend because the latent path will need its hidden states/KV cache. For quick
+remote inference, the text baseline may call an external vLLM OpenAI-compatible
+server (`/v1/chat/completions`); vLLM is intentionally not a repository
+dependency. The adapter sends standard `temperature=0`, `top_p=1`, `seed=42`,
+and Qwen `chat_template_kwargs.enable_thinking=false`. Load the
 model once, use greedy decoding and record its exact path/name. Generation
 caching is an optimization, not an M2 prerequisite.
 
@@ -429,10 +433,29 @@ If B2 does not improve, or almost every correct B2 case is already correct at
 B0, stop and redesign the data/task partition. More routers, graph types, and
 result schemas will not repair a task that does not require collaboration.
 
+### 8.5 One 10-hospital robustness check
+
+Structured results on all 401 cases:
+
+| Setting | B0 | B1 | B2 |
+| --- | ---: | ---: | ---: |
+| Ring `R=4,k=2` | 38.65% | 65.59% | 72.32% |
+| Ring `R=10,k=2` | 38.65% | 65.59% | 73.57% |
+| Complete `R=2,k=9` | 38.65% | 73.57% | 73.57% |
+
+```text
+outputs_distributed/structured_10_ring_r4_k2
+outputs_distributed/structured_10_ring_r10_k2
+outputs_distributed/structured_10_complete_r2_k9
+```
+
+The structured check is complete. Run only the matched 50-case text pilot
+before M3; defer additional topology experiments.
+
 ## 9. Deferred Evaluations
 
 Macro-F1, confidence intervals, expertise routing, oracle routing, topology
-sweeps, load balance, privacy attacks, and scaling beyond five hospitals are
+sweeps, load balance, privacy attacks, and scaling beyond ten hospitals are
 reasonable later evaluations. They are explicitly outside the M2 critical
 path. Add one only when the canonical result exposes a concrete question that
 the additional evaluation answers.
@@ -635,9 +658,8 @@ select the earliest unblocked task. Use the following conventions:
 - At the end of a session, run the narrow relevant tests, record the command
   and result on the task line, and leave unrelated checkboxes unchanged.
 
-Current focus: `M2L1`. M0/M1 behavior is accepted; `bd5d825` is only the
-behavioral reference. Prune framework code on both sides of that commit, then
-run the fixed M2 experiment before implementing latent communication.
+Current focus: `M2R2`. M2L and the ten-hospital structured robustness check are
+complete. Run one matched N=10 text pilot, then start latent communication.
 
 Completed planning tasks:
 
@@ -714,30 +736,53 @@ canonical result existed. Do not complete those tasks under their old scope.
   end-to-end path, not by preserving the `bd5d825` APIs. **DONE (2026-09-07;
   `python -m pytest -q` in `DecentralizedMAS` passed 19 tests; one-case
   structured runner smoke passed).**
-- [ ] **M2L2 - Run the canonical structured baseline.** Use the fixed Section 8
+- [x] **M2L2 - Run the canonical structured baseline.** Use the fixed Section 8
   setting and existing code to run B0, B1, and B2 on all 401 skewed test cases.
   Emit the minimal per-case JSONL and per-method summary directly from the
   runner. Also run only the `R=2` ring and complete-graph reference. **Done
   when:** predictions, accuracy, messages, and bytes are saved and rerunnable
-  from one documented command.
-- [ ] **M2L3 - Run the matched text pilot and decide.** Run B2 text on the same
+  from one documented command. **DONE (2026-09-08; artifacts under
+  `outputs_distributed/`).** On all 401 skewed cases, ring `R=4`, `k=2` gave
+  B0 `169/401` (42.14%), B1 `275/401` (68.58%), and B2 `303/401` (75.56%).
+  Ring `R=2`, `k=2` left B2 at B1 accuracy; complete `R=2`, `k=4` matched ring
+  B2 predictions exactly at 75.56%. Alias-aware evaluation did not change any
+  structured count.
+- [x] **M2L3 - Run the matched text pilot and decide.** Run B2 text on the same
   first 50 cases and fixed route/model, report source-local/remote/no-gold
   retrieval fractions using a direct retrieval scan, then apply the Section 8.4
-  go/no-go criterion. **Done when:** one short experiment note either authorizes
-  M3 or states that the data/task must change.
+  go/no-go criterion. **DONE (2026-09-08; `Qwen/Qwen3-4B-Instruct-2507`,
+  ring `R=4`, `k=2`, first 50 canonical cases).** B2 text obtained `19/50`
+  (38.0%) under declared-alias matching, compared with structured B2 `39/50`
+  (78.0%) on the same cases, with 10 messages and 4308.02 mean bytes. Retrieval
+  coverage was 38.0% source-local gold hit, 86.0% remote gold hit, and 10.0%
+  no gold hit anywhere. **Decision: GO to M3.** Structured B2's full-set gain
+  over B0/B1 is concentrated in reachable remote evidence; free-form text does
+  not improve it and should remain a bandwidth/utility baseline.
+- [x] **M2R1 - Ten-hospital structured robustness.** Run structured B0/B1/B2
+  on all 401 cases for the `N=10` ring at `R=4,k=2`, the full-ring diagnostic
+  at `R=10,k=2`, and the complete reference at `R=2,k=9`. **DONE (2026-09-08;
+  official artifacts under `outputs_distributed/structured_10_*` reproduce B0
+  `38.65%`, B1 `65.59%`, ring-R4 B2 `72.32%`, and full-reach B2 `73.57%`).**
+- [ ] **M2R2 - Ten-hospital matched text pilot.** Run text B0/B1/B2 on the same
+  first 50 cases, `N=10` ring, `R=4,k=2`, and
+  `Qwen/Qwen3-4B-Instruct-2507`. Reuse the current runner/output schema and add
+  no topology abstraction. **Done when:** artifacts are saved and one sentence
+  selects `N=5` or `N=10` for M3 based on collaboration gain, text behavior,
+  runtime, and communication cost.
 
 ### 15.4 M3 - Fixed-route latent path
 
 - [ ] **L3L1 - Minimal latent message path.** Reuse the current distiller and
   frozen same-backbone model. Add only the code needed for an activated agent
   to consume incoming latent blocks with its local retrieval and emit one new
-  fixed-size block along the already-fixed B2 route. **Depends:** M2L3 go.
+  fixed-size block along the selected fixed B2 route. **Depends:** M2R2.
   **Done when:** a constructed two-hop test demonstrates re-encoding rather
   than opaque forwarding.
 - [ ] **L3L2 - Matched latent comparison.** Train/evaluate on the same five-node
-  ring, episodes, `R`, `k`, and retrieval used by M2. Compare diagnosis accuracy
-  and transmitted bytes against structured and text. **Depends:** L3L1. **Done
-  when:** one reproducible result table exists.
+  or ten-node ring selected by M2R2, using exactly its episodes, `R`, `k`, and
+  retrieval. Compare diagnosis accuracy and transmitted bytes against
+  structured and text. **Depends:** L3L1. **Done when:** one reproducible result
+  table exists.
 
 ### 15.5 Later work, not active tasks
 
@@ -746,7 +791,7 @@ larger `N`, heterogeneous backbones, formal privacy attacks, and robustness are
 deferred. Promote only one of them into an active task when the M3 result shows
 which limitation actually matters.
 
-The active sequence is `M2L1 -> M2L2 -> M2L3 -> L3L1 -> L3L2`.
+The active sequence is `M2R2 -> L3L1 -> L3L2`.
 
 ### 15.6 Session log
 
@@ -764,5 +809,8 @@ notes rather than expanding this table indefinitely.
 | 2026-09-07 | Deep foundation prune review | M2L1 | `bd5d825` dependency/line audit; no runtime code changed | Treat the commit as behavioral reference; target eight core modules and one runner |
 | 2026-09-07 | Lean M2 runtime reduction | M2L1 | `DecentralizedMAS`: `python -m pytest -q` (19 passed); one-case structured `run_distributed_medical.py` smoke | Removed retired layers and APIs; canonical runner is ready for M2L2 |
 | 2026-09-08 | GPU-runner preparation | M2L2, M2L3 | `DecentralizedMAS`: 19 tests passed; two real skewed cases passed for canonical, path, and complete settings; repeated structured artifacts were identical | Runner now records reproducibility metadata; [distributed M2 commands](docs/distributed_m2.md) are ready for the external instance |
+| 2026-09-08 | Canonical M2 results and text pilot | M2L2, M2L3 | 401-case structured ring/ablation artifacts and 50-case Qwen text artifact under `outputs_distributed/` | B2 ring `R=4` improves B0/B1; text B2 is lower utility and higher bandwidth; GO to M3 |
 | 2026-09-08 | Optional graph generators | deferred evaluation infrastructure | `DecentralizedMAS`: 21 tests passed, including seeded NetworkX generators | ER/Watts-Strogatz/SBM are importable through `medlatent[graphs]`, but deliberately not exposed by the fixed M2 runner |
 | 2026-09-08 | Alias-aware distributed evaluation | M2L2, M2L3 | `DecentralizedMAS`: 22 tests passed; existing JSONL re-score left structured results unchanged and raised Qwen B2 first-50 from 16 to 19 correct | Accuracy now accepts declared `disease_aliases`; rerun artifacts to record the rule in their manifests |
+| 2026-09-08 | Ten-hospital pre-M3 review | M2R1 | `DecentralizedMAS`: 22 tests passed; local 401-case structured diagnostics under `tmp/m2_review_10_*` | N=10 preserves the collaboration signal; run one official matched text pack, not a topology sweep |
+| 2026-09-08 | Ten-hospital structured artifacts received | M2R1 | Three official artifacts under `outputs_distributed/structured_10_*`; values match the local diagnostic | Structured robustness complete; only matched N=10 text remains before M3 |
