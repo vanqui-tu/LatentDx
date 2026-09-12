@@ -1,6 +1,6 @@
 # Distributed Communication for Private-Knowledge Diagnosis
 
-> Working research and implementation plan. Last updated: 2026-09-09.
+> Working research and implementation plan. Last updated: 2026-09-12.
 >
 > Current scope: Phase 1 supports fixed, simple, undirected graphs only.
 > Directed graphs, dynamic topology, node churn, and network failures are
@@ -321,12 +321,13 @@ and later latent payloads:
 medlatent/distributed/
   graph.py               graph + ring/complete/path helpers
   messages.py            request/proposal envelopes and byte cost
-  channels.py            structured/text; latent added later
+  channels.py            structured/text; small latent KV payload helper
   agent.py               query-scoped local state
   episode.py             synchronous scheduler and event trace
   medical.py             hospital stores, query loading, source assignment
   medical_baselines.py   B0/B1/B2 and mean-score aggregation
   textmas.py             Transformers adapter and prompts
+  latent.py              fixed-route latent training/inference path
 
 scripts/
   run_distributed_medical.py
@@ -493,63 +494,101 @@ Useful early hypotheses to test are:
 
 These are hypotheses, not assumed conclusions.
 
-## 11. Path to Learned Latent Communication
+## 11. Learned Latent Communication (M3)
 
-### 11.1 Same-backbone, fixed topology first
+M3 is a fresh trainable experiment, not a patch to the deleted prototype. Use
+the fixed M2 setting: `N=10`, ring, `R=4`, `k=2`, the same private stores,
+retrieval, query split, and B2 parent routes. Routing and aggregation are fixed;
+only the latent interface is learned.
 
-Start with one frozen backbone shared by all agents so latent spaces are
-aligned. At each active node:
+### 11.1 Transport contract
 
-1. encode query, local retrieval, local state, and incoming blocks;
-2. update the node state with a shared model;
-3. distill a fixed number `m` of outgoing latent positions; and
-4. send separate or receiver-conditioned blocks along selected edges.
+Use a contextualized **KV block** in the frozen backbone's native cache format,
+as in MedLatent-H. Do not send raw hidden states or text. One block has exactly
+`m` latent positions and contains the key/value tensors for those positions at
+every decoder layer. All agents use one backbone/model family, so no projector
+or cross-family adapter is needed.
 
-Existing `LatentDistiller` and boundary embeddings are reusable components,
-but the current concatenation-to-host forward path is not the multi-hop method.
-A received KV block cannot simply be forwarded unchanged as if it were a
-semantic packet. The receiver must consume incoming blocks with local evidence
-and re-encode an updated message; otherwise multi-hop nodes do no computation
-and model-layer/cache semantics become ambiguous.
+During training, the block is an in-memory differentiable object (a tuple of
+per-layer key/value tensors). Do not serialize it or detach it between hops.
+During evaluation, it may be detached for logging and its wire cost is the
+serialized tensor byte count plus a small fixed metadata header.
 
-Train with fixed routes first. Possible supervision is distillation from a
-strong text-communication teacher plus final diagnosis loss. This isolates
-representation learning from discrete routing instability.
+### 11.2 Per-agent computation
 
-### 11.2 Learn aggregation and routing incrementally
-
-After fixed-route latent communication works:
-
-- learn gated/attention aggregation of multiple incoming blocks;
-- learn a relevance score over legal outgoing neighbors;
-- apply masked top-`k` selection so `a_ij <= A_ij` by construction;
-- add an explicit stop action and budget penalty;
-- compare straight-through/Gumbel selection, policy gradients, and supervised
-  router distillation only after a deterministic scoring baseline exists.
-
-A provisional multi-objective loss is
+Each active agent has one private local prompt `x_i` built from the query and
+its own top-1 retrieved case. Let `B_in` be the KV cache returned by the parent,
+or empty at the source. The agent runs the frozen decoder with `B_in` as past
+context and `x_i` as new input, then appends learned latent markers and rolls
+out `m` latent positions using the new shared `LatentDistiller`:
 
 ```text
-L = L_task
-  + lambda_distill * L_teacher
-  + lambda_comm * transmitted_bytes
-  + lambda_route * selected_edges
-  + lambda_balance * load_imbalance
-  + lambda_priv * privacy_adversary_score.
+past = B_in
+past = Decoder(past, x_i)
+past = Decoder(past, BEGIN)
+repeat m times:
+    z = Distiller(previous_hidden)
+    past = Decoder(past, z)
+past = Decoder(past, END)
+B_out = last (m + BEGIN + END) KV positions from past
 ```
 
-Do not optimize all terms in the first learned run. Establish task learning,
-then add communication constraints, then privacy adversaries. Report the full
-Pareto trade-off rather than selecting one unexplained coefficient setting.
+`B_out` is newly computed at every hop and includes the agent's local evidence
+plus the incoming context. The intermediate agent never forwards `B_in`
+unchanged. A relay performs in-network aggregation: it consumes child block(s)
+and its own local evidence, emits one new `B_out`, and returns only that summary
+along the parent path. The source therefore receives one final summary per
+branch, not every node-local block. In the N=10 ring each one-hop branch relay
+has at most one outward child, so this is a sequential re-encoding. If a future
+topology gives a relay multiple children, concatenate them in stable child order
+before re-encoding; no learned set aggregator is part of M3. The source
+concatenates the final summaries from the two ring branches in deterministic
+branch order, similar to the original MedLatent host concatenation.
 
-### 11.3 Heterogeneous agents later
+### 11.3 Train from new parameters
 
-Cross-family agents require a defined transport space. Options include a
-canonical learned latent space, sender-to-canonical plus canonical-to-receiver
-adapters, or per-family/per-edge projectors. LatentDx-X offers a useful
-starting point, but pairwise adapters scale poorly with the number of model
-families. Heterogeneity should follow, not precede, a convincing same-backbone
-multi-hop result.
+Load only a frozen base model and tokenizer. Initialize a new shared
+`LatentDistiller` and new learned `BEGIN`/`END` embeddings; old MedLatent-H/X
+checkpoints are optional references only and must not be required inputs. The
+only trainable parameters are this distiller and the two boundary embeddings.
+
+For each training episode, execute the complete fixed B2 route, construct the
+source context from the returned blocks, and teacher-force the gold diagnosis.
+Use ordinary diagnosis cross-entropy:
+
+```text
+L = CE(gold_answer | source_private_query, returned_KV_blocks)
+```
+
+Keep the backbone in `eval()` and freeze all backbone parameters, but preserve
+autograd through every decoder call and every in-memory KV block. No `.detach()`
+or `torch.no_grad()` is allowed around the training forward pass. The training
+checkpoint contains the new distiller, boundaries, model identifier, `m`, route
+settings, and optimizer/training metadata. It is a new checkpoint even when the
+base model is the same one used by MedLatent.
+
+Run one episode at a time and process the two ring branches sequentially; do
+not batch all agents or retain each relay's full prompt cache. The final KV
+slice must be cloned, not detached, so its small storage survives while its
+gradient path remains intact. Checkpoint each decoder call while gradients are
+enabled to recompute frozen-backbone activations during backward. This trades
+compute for bounded VRAM and still retains only the two final branch summaries.
+
+First verify gradient flow and overfit a tiny two-hop synthetic batch. Then train
+on the medical training split. Use the existing MedLatent diagnosis loss and
+checkpoint conventions where convenient, but do not import the old centralized
+all-hospital forward path as the distributed protocol.
+
+### 11.4 Evaluation and non-goals
+
+Evaluate only a loadable newly trained checkpoint on the same 401 N=10 test
+episodes used by structured M2. Report diagnosis accuracy, mean latent-block
+bytes/messages, `m`, and a trace proving B2 reaches the source through the
+two-hop route. Compare directly with structured B2 and text B2.
+
+Do not implement learned routing, GNN aggregation, topology search, dynamic
+graphs, cross-family projection, policy gradients, communication penalties,
+privacy adversaries, or a generalized latent registry in M3.
 
 ## 12. Verification Plan
 
@@ -596,13 +635,13 @@ structured results exist for all 401 skewed test cases, the 50-case text pilot
 runs on the same route, and per-case outputs show whether remote and two-hop
 evidence help. Do not expand the experiment matrix before this result exists.
 
-### M3: fixed-route latent communication
+### M3: train a new fixed-route latent protocol
 
-Add same-backbone multi-hop latent re-encoding on the same fixed ring protocol.
-Exit when latent blocks survive a constructed two-hop task and can be compared
-with the M2 structured/text results at the same route and episode set. A GNN
-baseline is optional and should be added only if it answers an observed latent
-aggregation issue.
+Build and train a new same-backbone latent communication interface on the fixed
+`N=10` ring (`R=4`, `k=2`) protocol. Do not reuse old MedLatent checkpoints.
+Exit only when a new distiller/boundary checkpoint is trained, a two-hop test
+proves intermediate re-encoding, and the checkpoint is evaluated against the
+M2 structured/text runs on the same episodes.
 
 ### M4: learned protocol
 
@@ -658,8 +697,8 @@ select the earliest unblocked task. Use the following conventions:
 - At the end of a session, run the narrow relevant tests, record the command
   and result on the task line, and leave unrelated checkboxes unchanged.
 
-Current focus: `M2R2`. M2L and the ten-hospital structured robustness check are
-complete. Run one matched N=10 text pilot, then start latent communication.
+Current focus: `L3.1`. M2 is complete. The previous latent prototype was
+deleted; implement the new KV-based trainable protocol below.
 
 Completed planning tasks:
 
@@ -770,19 +809,36 @@ canonical result existed. Do not complete those tasks under their old scope.
   selects `N=5` or `N=10` for M3 based on collaboration gain, text behavior,
   runtime, and communication cost.
 
-### 15.4 M3 - Fixed-route latent path
+### 15.4 M3 - New fixed-route latent protocol
 
-- [ ] **L3L1 - Minimal latent message path.** Reuse the current distiller and
-  frozen same-backbone model. Add only the code needed for an activated agent
-  to consume incoming latent blocks with its local retrieval and emit one new
-  fixed-size block along the selected fixed B2 route. **Depends:** M2R2.
-  **Done when:** a constructed two-hop test demonstrates re-encoding rather
-  than opaque forwarding.
-- [ ] **L3L2 - Matched latent comparison.** Train/evaluate on the same five-node
-  or ten-node ring selected by M2R2, using exactly its episodes, `R`, `k`, and
-  retrieval. Compare diagnosis accuracy and transmitted bytes against
-  structured and text. **Depends:** L3L1. **Done when:** one reproducible result
-  table exists.
+- [x] **L3.1 - Define the KV protocol.** Implement the Section 11 contract:
+  one incoming child summary (or stable ordered child summaries), one private
+  top-1 local prompt, one newly re-encoded `m`-position block, and one final
+  summary per source branch. Child summaries are aggregated at the relay and
+  are not all returned separately. **Done
+  when:** the code documents tensor/cache shapes and has no hidden-state or
+  unrelated-checkpoint transport path. **DONE (2026-09-12; `distributed/latent.py`
+  defines tuple KV blocks, stable child merge, and fresh relay re-encoding).**
+- [x] **L3.2 - Differentiable KV rollout.** Freeze the backbone but initialize
+  new distiller and boundary parameters. Preserve autograd through local
+  decoder calls, latent rollout, KV slicing, and source prediction. **Done when:**
+  a tiny two-hop batch gives nonzero gradients to both distiller and boundaries.
+  **DONE (2026-09-12; `tests/test_distributed_latent.py`, focused and full suite
+  pass in `DecentralizedMAS`).**
+- [ ] **L3.3 - Train and checkpoint.** Train only on fixed N=10 ring/B2 episodes
+  with diagnosis cross-entropy. Overfit a tiny synthetic batch first, then train
+  on medical train data. Save a new loadable checkpoint with model ID, `m`, route
+  settings, distiller, boundaries, and training metadata. **Done when:** loss
+  decreases in the tiny smoke and a real checkpoint loads.
+- [ ] **L3.4 - Protocol tests.** Test one-hop `R=2`, two-hop `R=4`, final-round
+  delivery, parent relay, exactly one summary per branch, deterministic child /
+  branch order, and no raw-record/text payload. **Done when:** tests fail for
+  opaque forwarding, returning every child block separately, dropped final
+  blocks, wrong shapes, or detached training tensors.
+- [ ] **L3.5 - Matched evaluation.** Evaluate the new checkpoint on the same 401
+  N=10 ring test episodes as M2 and compare accuracy and bytes with structured
+  B2/text B2. Record checkpoint hash and command. **Done when:** one result
+  table exists. No learned routing or alternate topology before this point.
 
 ### 15.5 Later work, not active tasks
 
@@ -791,7 +847,7 @@ larger `N`, heterogeneous backbones, formal privacy attacks, and robustness are
 deferred. Promote only one of them into an active task when the M3 result shows
 which limitation actually matters.
 
-The active sequence is `M2R2 -> L3L1 -> L3L2`.
+The active sequence is `L3.1 -> L3.2 -> L3.3 -> L3.4 -> L3.5`.
 
 ### 15.6 Session log
 
@@ -814,3 +870,6 @@ notes rather than expanding this table indefinitely.
 | 2026-09-08 | Alias-aware distributed evaluation | M2L2, M2L3 | `DecentralizedMAS`: 22 tests passed; existing JSONL re-score left structured results unchanged and raised Qwen B2 first-50 from 16 to 19 correct | Accuracy now accepts declared `disease_aliases`; rerun artifacts to record the rule in their manifests |
 | 2026-09-08 | Ten-hospital pre-M3 review | M2R1 | `DecentralizedMAS`: 22 tests passed; local 401-case structured diagnostics under `tmp/m2_review_10_*` | N=10 preserves the collaboration signal; run one official matched text pack, not a topology sweep |
 | 2026-09-08 | Ten-hospital structured artifacts received | M2R1 | Three official artifacts under `outputs_distributed/structured_10_*`; values match the local diagnostic | Structured robustness complete; only matched N=10 text remains before M3 |
+| 2026-09-08 | Ten-hospital text baseline and vLLM support | M2R2 | `outputs_distributed/text_10_ring_r4_k2`; commit `16fcca0` adds external vLLM endpoint support | M2 complete; next task L3.1 |
+| 2026-09-12 | Rewrite M3 latent design after deleting prototype | L3.1-L3.5 | Documentation-only; new KV transport, fresh trainable checkpoint, fixed N=10 route | Next task: L3.1 |
+| 2026-09-12 | Implement differentiable distributed KV protocol | L3.1, L3.2 | `DecentralizedMAS`: `python -m pytest -q` (25 passed) | Checkpointed frozen decoder; compact KV slices preserve gradients; relay re-encodes one `(m+2)` block |
