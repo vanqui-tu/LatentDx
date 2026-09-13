@@ -19,7 +19,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from ..hf_data import IGNORE_INDEX
-from ..hf_medlatent_h import _build_position_ids, _iter_key_value_pairs
+from ..hf_medlatent_h import _build_position_ids, _iter_key_value_pairs, _to_dynamic_cache
 from ..losses import diagnosis_cross_entropy
 from ..modules import BoundaryEmbeddings, LatentDistiller
 
@@ -106,7 +106,14 @@ class DistributedLatentProtocol:
         # CausalLM wrappers expose the decoder as base_model.  Keeping this
         # call separate makes tiny fake decoders usable in protocol tests.
         decoder = getattr(self.model, "base_model", self.model)
+        if kwargs.get("past_key_values") is not None and self._requires_dynamic_cache(decoder):
+            kwargs["past_key_values"] = _to_dynamic_cache(kwargs["past_key_values"])
         return decoder(**kwargs)
+
+    @staticmethod
+    def _requires_dynamic_cache(model: torch.nn.Module) -> bool:
+        config = getattr(model, "config", None)
+        return getattr(config, "model_type", None) == "qwen3"
 
     def _decoder_with_cache(self, *, input_ids: torch.Tensor | None = None,
                             inputs_embeds: torch.Tensor | None = None,
@@ -233,17 +240,23 @@ class DistributedLatentProtocol:
                 cache = None if not flat else tuple(
                     (flat[2 * index], flat[2 * index + 1]) for index in range(layer_count)
                 )
-                return self.model(
+                decoder_kwargs = dict(
                     inputs_embeds=values, attention_mask=mask, position_ids=pos,
                     past_key_values=cache, use_cache=False, return_dict=True,
-                ).logits
+                )
+                if cache is not None and self._requires_dynamic_cache(self.model):
+                    decoder_kwargs["past_key_values"] = _to_dynamic_cache(cache)
+                return self.model(**decoder_kwargs).logits
 
             logits = checkpoint(forward, embeddings, attention, positions, *flat_past, use_reentrant=False)
         else:
-            logits = self.model(
+            decoder_kwargs = dict(
                 input_ids=input_ids, attention_mask=attention, position_ids=positions,
                 past_key_values=past, use_cache=False, return_dict=True,
-            ).logits
+            )
+            if past is not None and self._requires_dynamic_cache(self.model):
+                decoder_kwargs["past_key_values"] = _to_dynamic_cache(past)
+            logits = self.model(**decoder_kwargs).logits
         return logits
 
 
@@ -311,7 +324,7 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path,
     torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[dtype]
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from ..hf_data import MedLatentDiagnosisDataset, _pad
-    from ..medical import load_medical_split, sample_balanced_sources
+    from .medical import load_medical_split, sample_balanced_sources
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, local_files_only=local_files_only)
     if tokenizer.pad_token_id is None:
