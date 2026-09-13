@@ -13,7 +13,11 @@ from .medical import (
 from .medical_baselines import MedicalBaselineKind, MedicalBaselineResult, run_medical_baseline
 from .messages import MessageEnvelope, MessageKind, ProposalPayload, RequestPayload, TextProposalPayload, TextRequestPayload
 from .textmas import TextGeneration, TextGenerator, TransformersTextGenerator, VllmTextGenerator, build_agent_prompt, build_host_prompt, parse_textmas_answer
-from .latent import DistributedLatentProtocol, KVBlock, LatentKVProtocol, kv_wire_bytes, merge_kv_blocks, slice_kv_block
+from .latent import (
+    DistributedLatentProtocol, KVBlock, LatentKVProtocol, kv_wire_bytes, load_distributed_latent_checkpoint,
+    merge_kv_blocks, ring_two_hop_branches, run_two_hop_ring_query, save_distributed_latent_checkpoint,
+    select_kv_rows, slice_kv_block, train_distributed_latent_real, two_hop_ring_blocks,
+)
 
 __all__ = [
     "AgentEpisodeState", "AgentRuntime", "PrivateKnowledgeStore",
@@ -25,5 +29,8 @@ __all__ = [
     "load_medical_dataset_splits", "load_medical_split", "prediction_matches_target", "sample_balanced_sources",
     "MedicalBaselineKind", "MedicalBaselineResult", "run_medical_baseline",
     "TextGeneration", "TextGenerator", "TransformersTextGenerator", "VllmTextGenerator", "build_agent_prompt", "build_host_prompt", "parse_textmas_answer",
-    "DistributedLatentProtocol", "LatentKVProtocol", "KVBlock", "merge_kv_blocks", "slice_kv_block", "kv_wire_bytes",
+    "DistributedLatentProtocol", "LatentKVProtocol", "KVBlock", "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "kv_wire_bytes",
+    "ring_two_hop_branches", "two_hop_ring_blocks", "run_two_hop_ring_query",
+    "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",
+    "train_distributed_latent_real",
 ]

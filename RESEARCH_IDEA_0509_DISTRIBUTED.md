@@ -1,6 +1,6 @@
 # Distributed Communication for Private-Knowledge Diagnosis
 
-> Working research and implementation plan. Last updated: 2026-09-12.
+> Working research and implementation plan. Last updated: 2026-09-13.
 >
 > Current scope: Phase 1 supports fixed, simple, undirected graphs only.
 > Directed graphs, dynamic topology, node churn, and network failures are
@@ -825,7 +825,7 @@ canonical result existed. Do not complete those tasks under their old scope.
   a tiny two-hop batch gives nonzero gradients to both distiller and boundaries.
   **DONE (2026-09-12; `tests/test_distributed_latent.py`, focused and full suite
   pass in `DecentralizedMAS`).**
-- [ ] **L3.3 - Train and checkpoint.** Train only on fixed N=10 ring/B2 episodes
+- [ ] **L3.3 - Train and checkpoint. IN PROGRESS (2026-09-13).** Train only on fixed N=10 ring/B2 episodes
   with diagnosis cross-entropy. Overfit a tiny synthetic batch first, then train
   on medical train data. Save a new loadable checkpoint with model ID, `m`, route
   settings, distiller, boundaries, and training metadata. **Done when:** loss
@@ -873,3 +873,4 @@ notes rather than expanding this table indefinitely.
 | 2026-09-08 | Ten-hospital text baseline and vLLM support | M2R2 | `outputs_distributed/text_10_ring_r4_k2`; commit `16fcca0` adds external vLLM endpoint support | M2 complete; next task L3.1 |
 | 2026-09-12 | Rewrite M3 latent design after deleting prototype | L3.1-L3.5 | Documentation-only; new KV transport, fresh trainable checkpoint, fixed N=10 route | Next task: L3.1 |
 | 2026-09-12 | Implement differentiable distributed KV protocol | L3.1, L3.2 | `DecentralizedMAS`: `python -m pytest -q` (25 passed) | Checkpointed frozen decoder; compact KV slices preserve gradients; relay re-encodes one `(m+2)` block |
+| 2026-09-13 | Start fixed-route latent training path | L3.3 | `DecentralizedMAS`: latent focused tests (3 passed), full suite (26 passed) | One query at a time; two ring branches batched per hop; new `train_distributed_latent.py` checkpoint entrypoint |

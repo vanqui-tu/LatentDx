@@ -1,6 +1,10 @@
 import torch
 
-from medlatent.distributed.latent import DistributedLatentProtocol, merge_kv_blocks, slice_kv_block
+from medlatent.distributed.latent import (
+    DistributedLatentProtocol, load_distributed_latent_checkpoint, merge_kv_blocks,
+    ring_two_hop_branches, save_distributed_latent_checkpoint, slice_kv_block,
+    two_hop_ring_blocks,
+)
 from medlatent.modules import BoundaryEmbeddings, LatentDistiller
 
 
@@ -62,6 +66,20 @@ def test_two_hop_rollout_reencodes_and_keeps_gradients():
     assert protocol.boundary.end.grad.abs().sum() > 0
 
 
+def test_source_teacher_forcing_loss_uses_batched_branches():
+    model = _Model()
+    protocol = DistributedLatentProtocol(model, LatentDistiller(4), BoundaryEmbeddings(4), num_latents=2)
+    ids = torch.tensor([[1, 2], [3, 4]])
+    mask = torch.ones_like(ids)
+    branches = two_hop_ring_blocks(protocol, leaf_ids=ids, leaf_mask=mask, relay_ids=ids, relay_mask=mask)
+    source_ids = torch.tensor([[1, 2]])
+    source_mask = torch.ones_like(source_ids)
+    target_ids = torch.tensor([[1, 2, 3]])
+    labels = target_ids.clone()
+    loss = protocol.source_loss(source_ids, source_mask, target_ids, labels, branches)
+    assert loss.ndim == 0 and torch.isfinite(loss)
+
+
 def test_sliced_block_copies_storage_without_detaching():
     key = torch.randn(1, 1, 12, 4, requires_grad=True)
     value = torch.randn(1, 1, 12, 4, requires_grad=True)
@@ -71,3 +89,19 @@ def test_sliced_block_copies_storage_without_detaching():
     assert block[0][0].untyped_storage().data_ptr() != key.untyped_storage().data_ptr()
     block[0][0].sum().backward()
     assert key.grad[:, :, -4:, :].abs().sum() > 0
+
+
+def test_fixed_route_and_checkpoint_metadata(tmp_path):
+    assert ring_two_hop_branches(0, 10) == ((2, 1), (8, 9))
+    model = _Model()
+    protocol = DistributedLatentProtocol(model, LatentDistiller(4), BoundaryEmbeddings(4), num_latents=2)
+    optimizer = torch.optim.AdamW(list(protocol.distiller.parameters()) + list(protocol.boundary.parameters()))
+    path = tmp_path / "distributed_latent.pt"
+    save_distributed_latent_checkpoint(
+        path, protocol=protocol, model_name="fake/model", route={"num_agents": 10, "rounds": 4, "max_fanout": 2},
+        optimizer=optimizer, training={"updates": 0},
+    )
+    payload = load_distributed_latent_checkpoint(path)
+    assert payload["module_type"] == "DistributedLatentKV"
+    assert payload["num_latents"] == 2
+    assert payload["route"]["num_agents"] == 10
