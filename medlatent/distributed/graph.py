@@ -1,4 +1,4 @@
-"""Fixed simple undirected communication graphs for M2."""
+"""Small fixed undirected communication graphs used by distributed pilots."""
 
 from __future__ import annotations
 
@@ -98,6 +98,54 @@ def ring_graph(num_agents: int) -> CommunicationGraph:
     adjacency[0, -1] = True
     adjacency[-1, 0] = True
     return CommunicationGraph(adjacency)
+
+
+def shortcut_ring_graph(
+    num_agents: int, *, seed: int = 42, num_shortcuts: int = 1,
+) -> CommunicationGraph:
+    """Build a seeded ring with bounded non-ring shortcuts.
+
+    Shortcuts are added in a seeded candidate order only when both endpoints
+    remain below degree three.  The ring therefore guarantees connectivity,
+    while the constructor remains deterministic and has no topology search.
+    """
+    count = _num_agents(num_agents)
+    if count < 3:
+        raise ValueError("a shortcut ring requires at least three agents")
+    shortcuts = _nonnegative(num_shortcuts, "num_shortcuts")
+    adjacency = ring_graph(count).adjacency.copy()
+    candidates = [
+        (left, right)
+        for left in range(count)
+        for right in range(left + 1, count)
+        if not adjacency[left, right]
+    ]
+    import random
+
+    random.Random(_nonnegative(seed, "seed")).shuffle(candidates)
+    added = 0
+    for left, right in candidates:
+        if added >= shortcuts:
+            break
+        if int(adjacency[left].sum()) >= 3 or int(adjacency[right].sum()) >= 3:
+            continue
+        adjacency[left, right] = adjacency[right, left] = True
+        added += 1
+    return CommunicationGraph(adjacency)
+
+
+# Descriptive alias used by experiment code and manifests.
+seeded_shortcut_ring_graph = shortcut_ring_graph
+
+
+def validate_graph_constraints(graph: CommunicationGraph, *, max_degree: int | None = None) -> None:
+    """Validate the Phase-1 graph contract and an optional degree bound."""
+    if not isinstance(graph, CommunicationGraph):
+        raise TypeError("graph must be a CommunicationGraph")
+    if max_degree is not None:
+        bound = _nonnegative(max_degree, "max_degree")
+        if any(len(graph.neighbors(agent_id)) > bound for agent_id in graph.agent_ids):
+            raise ValueError(f"graph degree exceeds max_degree={bound}")
 
 
 def erdos_renyi_graph(num_agents: int, edge_probability: float, *, seed: int, connectivity: str = "allow_disconnected") -> CommunicationGraph:

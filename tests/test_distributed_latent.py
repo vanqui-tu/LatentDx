@@ -2,7 +2,7 @@ import torch
 
 from medlatent.distributed.latent import (
     DistributedLatentProtocol, load_distributed_latent_checkpoint, merge_kv_blocks,
-    ring_two_hop_branches, save_distributed_latent_checkpoint, slice_kv_block,
+    batched_relay_aggregate, batched_rollout, ring_two_hop_branches, save_distributed_latent_checkpoint, slice_kv_block,
     two_hop_ring_blocks,
 )
 from medlatent.modules import BoundaryEmbeddings, LatentDistiller
@@ -89,6 +89,17 @@ def test_sliced_block_copies_storage_without_detaching():
     assert block[0][0].untyped_storage().data_ptr() != key.untyped_storage().data_ptr()
     block[0][0].sum().backward()
     assert key.grad[:, :, -4:, :].abs().sum() > 0
+
+
+def test_batched_local_and_relay_operator_detaches_children():
+    model = _Model()
+    protocol = DistributedLatentProtocol(model, LatentDistiller(4), BoundaryEmbeddings(4), num_latents=2)
+    ids = torch.tensor([[1, 2], [3, 4]])
+    mask = torch.ones_like(ids)
+    local = batched_rollout(protocol, ids, mask, detach_children=False)
+    relay = batched_relay_aggregate(protocol, ids, mask, [local])
+    assert local[0][0].shape[:3] == relay[0][0].shape[:3] == (2, 1, 4)
+    assert torch.autograd.grad(relay[0][0].sum(), local[0][0], allow_unused=True) == (None,)
 
 
 def test_fixed_route_and_checkpoint_metadata(tmp_path):

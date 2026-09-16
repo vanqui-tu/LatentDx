@@ -98,6 +98,7 @@ class MedLatentDiagnosisDataset(Dataset):
         hospital_dir: str | Path,
         tokenizer,
         num_hospitals: int = 3,
+        hospital_ids: list[int] | tuple[int, ...] | None = None,
         max_prompt_length: int = 320,
         max_target_length: int = 64,
         limit: int = -1,
@@ -106,6 +107,9 @@ class MedLatentDiagnosisDataset(Dataset):
     ) -> None:
         self.tokenizer = tokenizer
         self.num_hospitals = int(num_hospitals)
+        self.hospital_ids = tuple(range(self.num_hospitals)) if hospital_ids is None else tuple(int(x) for x in hospital_ids)
+        if len(self.hospital_ids) != self.num_hospitals or len(set(self.hospital_ids)) != self.num_hospitals:
+            raise ValueError("hospital_ids must contain num_hospitals unique IDs")
         self.max_prompt_length = int(max_prompt_length)
         self.max_target_length = int(max_target_length)
         rows = _read_json(data_file)
@@ -113,7 +117,7 @@ class MedLatentDiagnosisDataset(Dataset):
             rows = rows[:limit]
         self.records = [self._normalize(row, idx) for idx, row in enumerate(rows)]
         self.hospitals = []
-        for hospital_id in range(self.num_hospitals):
+        for hospital_id in self.hospital_ids:
             path = Path(hospital_dir) / f"hospital_{hospital_id}.json"
             self.hospitals.append([self._normalize(row, idx) for idx, row in enumerate(_read_json(path))])
         if not hpo_embeddings_file or not hpo_ic_file:
@@ -134,13 +138,13 @@ class MedLatentDiagnosisDataset(Dataset):
             "omim_code": _omim_code(row),
         }
 
-    def _retrieve(self, record: dict[str, Any], hospital_id: int) -> dict[str, Any]:
-        candidates = self.hospitals[hospital_id]
+    def _retrieve(self, record: dict[str, Any], hospital_index: int) -> dict[str, Any]:
+        candidates = self.hospitals[hospital_index]
         if not candidates:
-            raise ValueError(f"Hospital {hospital_id} has no records")
+            raise ValueError(f"Hospital {self.hospital_ids[hospital_index]} has no records")
         ranked = self.retriever.rank(record["hpo_codes"], candidates, top_k=2)
         if not ranked:
-            raise ValueError(f"Hospital {hospital_id} has no candidates")
+            raise ValueError(f"Hospital {self.hospital_ids[hospital_index]} has no candidates")
         selected = ranked[0].record
         if (
             str(selected.get("case_id") or selected.get("id") or "") == record["case_id"]
@@ -152,8 +156,8 @@ class MedLatentDiagnosisDataset(Dataset):
     def _build_example(self, idx: int) -> dict[str, Any]:
         record = self.records[idx]
         hospital_ids_all = []
-        for hospital_id in range(self.num_hospitals):
-            case = self._retrieve(record, hospital_id)
+        for hospital_index, hospital_id in enumerate(self.hospital_ids):
+            case = self._retrieve(record, hospital_index)
             prompt = build_hospital_prompt(
                 hospital_id=hospital_id,
                 case_disease=case["disease_name"],
@@ -173,6 +177,7 @@ class MedLatentDiagnosisDataset(Dataset):
         eos = self.tokenizer.eos_token or ""
         return {
             "case_id": record["case_id"],
+            "hospital_ids": self.hospital_ids,
             "omim_code": record["omim_code"],
             "hospital_ids_all": hospital_ids_all,
             "host_question_ids": _tokenize(self.tokenizer, host_text, self.max_prompt_length),

@@ -7,6 +7,7 @@ from medlatent.distributed import (
     erdos_renyi_graph,
     path_graph,
     ring_graph,
+    shortcut_ring_graph,
     stochastic_block_model_graph,
     watts_strogatz_graph,
 )
@@ -24,6 +25,14 @@ def test_m2_graph_helpers_and_paths_are_deterministic():
     assert path_graph(4).shortest_path_length(0, 3) == 3
     assert ring_graph(5).neighbors(0) == (1, 4)
     assert ring_graph(5).shortest_path_length(0, 2) == 2
+
+
+def test_seeded_shortcut_ring_is_bounded_and_reproducible():
+    first = shortcut_ring_graph(5, seed=42)
+    second = shortcut_ring_graph(5, seed=42)
+    assert np.array_equal(first.adjacency, second.adjacency)
+    assert set(ring_graph(5).edge_list()).issubset(set(first.edge_list()))
+    assert max(len(first.neighbors(agent_id)) for agent_id in first.agent_ids) <= 3
 
 
 def test_optional_graph_generators_are_seeded_and_return_current_graph_type():

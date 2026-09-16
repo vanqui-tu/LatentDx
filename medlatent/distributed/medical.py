@@ -111,26 +111,112 @@ class MedicalDatasetSplits:
     test: tuple[MedicalQueryRecord, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class Q4R6Paths:
+    """Canonical query/retrieval paths for the q4r6 experiment split."""
+
+    root: Path
+    train: Path
+    validation: Path
+    test: Path
+    hospital_dir: Path
+
+
+def q4r6_paths(data_dir: str | Path) -> Q4R6Paths:
+    root = Path(data_dir)
+    paths = Q4R6Paths(root, root / "train.json", root / "val.json", root / "test.json", root)
+    missing = [path for path in (paths.train, paths.validation, paths.test) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"q4r6 split file not found: {missing[0]}")
+    return paths
+
+
+def select_pilot_hospital_ids(
+    hospital_dir: str | Path, *, num_agents: int = 5,
+    pilot_hospital_ids: Sequence[int] | None = None,
+) -> tuple[int, ...]:
+    """Validate an explicit pilot selection, defaulting to the first IDs."""
+    root = Path(hospital_dir)
+    available = sorted(
+        int(match.group(1)) for path in root.glob("hospital_*.json")
+        if (match := re.fullmatch(r"hospital_(\d+)\.json", path.name))
+    )
+    if not available:
+        raise ValueError(f"no hospital_*.json files found in {root}")
+    if pilot_hospital_ids is None:
+        selected = tuple(available[:num_agents])
+    else:
+        selected = tuple(int(value) for value in pilot_hospital_ids)
+    if len(selected) != num_agents or len(set(selected)) != len(selected):
+        raise ValueError(f"pilot_hospital_ids must contain exactly {num_agents} unique IDs")
+    if any(value not in available for value in selected):
+        raise ValueError("pilot_hospital_ids must refer to existing hospital files")
+    return selected
+
+
 def load_hospital_private_stores(
     hospital_dir: str | Path,
     *,
     num_agents: int,
     hpo_embeddings_file: str | Path,
     hpo_ic_file: str | Path,
+    hospital_ids: Sequence[int] | None = None,
+    pilot_hospital_ids: Sequence[int] | None = None,
 ) -> dict[int, HospitalPrivateStore]:
     if num_agents <= 0:
         raise ValueError("num_agents must be positive")
     embeddings = _read_json_object(hpo_embeddings_file)
     ic_weights = _read_json_object(hpo_ic_file)
     root = Path(hospital_dir)
+    if hospital_ids is not None and pilot_hospital_ids is not None:
+        raise ValueError("pass only one of hospital_ids or pilot_hospital_ids")
+    selected = pilot_hospital_ids if pilot_hospital_ids is not None else hospital_ids
+    selected_ids = tuple(range(num_agents)) if selected is None else tuple(int(value) for value in selected)
+    if len(selected_ids) != num_agents or len(set(selected_ids)) != len(selected_ids):
+        raise ValueError("hospital_ids must contain num_agents unique IDs")
     return {
         agent_id: HospitalPrivateStore(
             agent_id,
-            _read_json_list(root / f"hospital_{agent_id}.json"),
+            _read_json_list(root / f"hospital_{hospital_id}.json"),
             HpoCosineRetriever(embeddings, ic_weights),
         )
-        for agent_id in range(num_agents)
+        for agent_id, hospital_id in enumerate(selected_ids)
     }
+
+
+def load_q4r6_dataset(
+    data_dir: str | Path, *, pilot_hospital_ids: Sequence[int] | None = None,
+    num_agents: int = 5,
+) -> tuple[MedicalDatasetSplits, tuple[int, ...]]:
+    """Load q4r6 query splits and the explicitly selected private hospitals."""
+    paths = q4r6_paths(data_dir)
+    selected = select_pilot_hospital_ids(paths.hospital_dir, num_agents=num_agents,
+                                         pilot_hospital_ids=pilot_hospital_ids)
+    splits = load_medical_dataset_splits(
+        train_file=paths.train, validation_file=paths.validation, test_file=paths.test,
+    )
+    query_ids = {record.query.case_id for split in (splits.train, splits.validation, splits.test) for record in split}
+    for hospital_id in selected:
+        store_ids = {record.query.case_id for record in load_medical_split(paths.hospital_dir / f"hospital_{hospital_id}.json")}
+        overlap = query_ids.intersection(store_ids)
+        if overlap:
+            raise ValueError(f"q4r6 query/retrieval case overlap for hospital {hospital_id}: {next(iter(overlap))}")
+    return splits, selected
+
+
+def load_q4r6_episodes(
+    data_dir: str | Path, *, split: str = "train", pilot_hospital_ids: Sequence[int] | None = None,
+    num_agents: int = 5, seed: int = 42,
+) -> tuple[tuple[MedicalEpisode, ...], tuple[int, ...]]:
+    """Load one q4r6 query split with deterministic pilot source assignment."""
+    splits, selected = load_q4r6_dataset(data_dir, pilot_hospital_ids=pilot_hospital_ids,
+                                         num_agents=num_agents)
+    try:
+        records = {"train": splits.train, "val": splits.validation, "validation": splits.validation,
+                   "test": splits.test}[split]
+    except KeyError as error:
+        raise ValueError("split must be train, val, validation, or test") from error
+    return sample_balanced_sources(records, split=split, num_agents=num_agents, seed=seed), selected
 
 
 def build_medical_agents(stores: Mapping[int, HospitalPrivateStore]) -> dict[int, AgentRuntime]:

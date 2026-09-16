@@ -53,6 +53,11 @@ def merge_kv_blocks(blocks: Sequence[KVBlock]) -> KVBlock | None:
     return tuple(merged)
 
 
+def detach_kv_block(block: KVBlock) -> KVBlock:
+    """Detach child summaries at the training-window boundary."""
+    return tuple((key.detach(), value.detach()) for key, value in block)
+
+
 def slice_kv_block(cache: Any, num_positions: int) -> KVBlock:
     """Copy final positions without retaining full prompt-cache storage."""
     if num_positions <= 0:
@@ -85,6 +90,19 @@ def ring_two_hop_branches(source_id: int, num_agents: int) -> tuple[tuple[int, i
         raise ValueError("invalid source_id")
     relays = tuple(sorted(((source_id - 1) % num_agents, (source_id + 1) % num_agents)) )
     return tuple((((2 * relay - source_id) % num_agents), relay) for relay in relays)  # type: ignore[return-value]
+
+
+def graph_two_hop_branches(graph: Any, source_id: int, *, max_branches: int = 2) -> tuple[tuple[int, int], ...]:
+    """Select deterministic two-hop branches from an arbitrary pilot graph."""
+    if max_branches <= 0:
+        raise ValueError("max_branches must be positive")
+    relays = graph.neighbors(source_id)[:max_branches]
+    branches = []
+    for relay in relays:
+        leaves = tuple(neighbor for neighbor in graph.neighbors(relay) if neighbor != source_id)
+        if leaves:
+            branches.append((leaves[0], relay))
+    return tuple(branches)
 
 
 class DistributedLatentProtocol:
@@ -162,11 +180,12 @@ class DistributedLatentProtocol:
         return output.past_key_values, attention
 
     def rollout(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
-                incoming: Sequence[KVBlock] = ()) -> KVBlock:
+                incoming: Sequence[KVBlock] = (), *, detach_incoming: bool = False) -> KVBlock:
         """Re-encode local private evidence and incoming child summaries."""
         if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
             raise ValueError("input_ids and attention_mask must both be [batch, sequence]")
-        incoming_block = merge_kv_blocks(tuple(incoming))
+        incoming_blocks = tuple(detach_kv_block(block) for block in incoming) if detach_incoming else tuple(incoming)
+        incoming_block = merge_kv_blocks(incoming_blocks)
         past = incoming_block
         prefix_len = 0 if past is None else past[0][0].shape[2]
         prefix_mask = attention_mask.new_ones((input_ids.shape[0], prefix_len))
@@ -197,6 +216,11 @@ class DistributedLatentProtocol:
             hidden = latent_out.last_hidden_state[:, -1, :]
         past, _ = self._append_embedding(self.boundary.end, prefix_mask, past)
         return slice_kv_block(past, self.num_latents + 2)
+
+    def relay_rollout(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+                      child_blocks: Sequence[KVBlock] = (), *, detach_children: bool = True) -> KVBlock:
+        """Encode local evidence together with ordered child summaries."""
+        return self.rollout(input_ids, attention_mask, child_blocks, detach_incoming=detach_children)
 
     def source_logits(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
                       branch_blocks: Sequence[KVBlock] = ()) -> torch.Tensor:
@@ -267,7 +291,7 @@ def two_hop_ring_blocks(protocol: DistributedLatentProtocol, *, leaf_ids: torch.
     if leaf_ids.shape[0] != 2 or relay_ids.shape[0] != 2:
         raise ValueError("leaf and relay batches must contain the two ring branches")
     leaf_blocks = protocol.rollout(leaf_ids, leaf_mask)
-    relay_blocks = protocol.rollout(relay_ids, relay_mask, [leaf_blocks])
+    relay_blocks = protocol.relay_rollout(relay_ids, relay_mask, [leaf_blocks], detach_children=False)
     return select_kv_rows(relay_blocks, 0), select_kv_rows(relay_blocks, 1)
 
 
@@ -280,8 +304,22 @@ def run_two_hop_ring_query(protocol: DistributedLatentProtocol, *, source_ids: t
     return protocol.source_logits(source_ids, source_mask, branches)
 
 
+def batched_rollout(protocol: DistributedLatentProtocol, input_ids: torch.Tensor,
+                    attention_mask: torch.Tensor, incoming: Sequence[KVBlock] = (), *,
+                    detach_children: bool = True) -> KVBlock:
+    """Run one shared local/relay operator over a padded batch."""
+    return protocol.rollout(input_ids, attention_mask, incoming, detach_incoming=detach_children)
+
+
+def batched_relay_aggregate(protocol: DistributedLatentProtocol, input_ids: torch.Tensor,
+                            attention_mask: torch.Tensor, child_blocks: Sequence[KVBlock] = (),
+                            *, detach_children: bool = True) -> KVBlock:
+    """Explicit relay entry point used by the batched pilot runner."""
+    return protocol.relay_rollout(input_ids, attention_mask, child_blocks, detach_children=detach_children)
+
+
 def save_distributed_latent_checkpoint(path: str | Path, *, protocol: DistributedLatentProtocol,
-                                       model_name: str, route: Mapping[str, int], optimizer: torch.optim.Optimizer,
+                                       model_name: str, route: Mapping[str, object], optimizer: torch.optim.Optimizer,
                                        training: Mapping[str, object]) -> None:
     """Save the only trainable modules plus fixed protocol metadata."""
     payload = {
@@ -304,27 +342,45 @@ def load_distributed_latent_checkpoint(path: str | Path, *, map_location: str | 
     return payload
 
 
-def train_distributed_latent_real(*, model_name: str, train_file: str | Path,
+def train_distributed_latent_real(*, model_name: str, train_file: str | Path | None = None,
+                                  query_file: str | Path | None = None,
                                   hospital_dir: str | Path, output_dir: str | Path,
                                   hpo_embeddings_file: str | Path, hpo_ic_file: str | Path,
                                   validation_file: str | Path | None = None,
-                                  num_agents: int = 10, num_latents: int = 8,
+                                  num_agents: int = 5, pilot_hospital_ids: Sequence[int] | None = None,
+                                  num_latents: int = 8, batch_size: int = 1,
+                                  gradient_accumulation_steps: int = 1, graph_seed: int = 42,
                                   max_prompt_length: int = 320, max_target_length: int = 64,
                                   epochs: int = 1, max_steps: int = 0, learning_rate: float = 1e-4,
                                   weight_decay: float = 0.01, seed: int = 42,
                                   device: str = "cuda", dtype: str = "bfloat16",
                                   local_files_only: bool = False) -> dict[str, float]:
-    """Train the fixed N=10 ring protocol one query at a time."""
-    if num_agents != 10:
-        raise ValueError("M3 fixed route requires num_agents=10")
-    if epochs <= 0 or (max_steps < 0):
+    """Train the shared operator on padded local/relay batches."""
+    query_file = query_file or train_file
+    if query_file is None:
+        raise ValueError("query_file is required")
+    if num_agents != 5:
+        raise ValueError("the M3 pilot currently requires num_agents=5")
+    if epochs <= 0 or max_steps < 0 or batch_size <= 0 or gradient_accumulation_steps <= 0:
         raise ValueError("epochs must be positive and max_steps non-negative")
     torch.manual_seed(seed)
     resolved_device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
     torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[dtype]
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from ..hf_data import MedLatentDiagnosisDataset, _pad
-    from .medical import load_medical_split, sample_balanced_sources
+    from .medical import load_medical_split, sample_balanced_sources, select_pilot_hospital_ids
+    from .graph import shortcut_ring_graph
+
+    pilot_ids = select_pilot_hospital_ids(hospital_dir, num_agents=num_agents,
+                                          pilot_hospital_ids=pilot_hospital_ids)
+    graph = shortcut_ring_graph(num_agents, seed=graph_seed, num_shortcuts=1)
+    split_paths = {"train": str(query_file)}
+    try:
+        from .medical import q4r6_paths
+        qpaths = q4r6_paths(Path(query_file).parent)
+        split_paths.update({"val": str(qpaths.validation), "test": str(qpaths.test)})
+    except (FileNotFoundError, ValueError):
+        pass
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, local_files_only=local_files_only)
     if tokenizer.pad_token_id is None:
@@ -340,13 +396,13 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path,
         num_latents=num_latents,
     )
     dataset = MedLatentDiagnosisDataset(
-        data_file=train_file, hospital_dir=hospital_dir, tokenizer=tokenizer,
+        data_file=query_file, hospital_dir=hospital_dir, tokenizer=tokenizer,
         num_hospitals=num_agents, max_prompt_length=max_prompt_length,
         max_target_length=max_target_length, hpo_embeddings_file=hpo_embeddings_file,
-        hpo_ic_file=hpo_ic_file,
+        hpo_ic_file=hpo_ic_file, hospital_ids=list(pilot_ids),
     )
     episodes = sample_balanced_sources(
-        load_medical_split(train_file), split=Path(train_file).stem,
+        load_medical_split(query_file), split=Path(query_file).stem,
         num_agents=num_agents, seed=seed,
     )
     rows_by_case = {row["case_id"]: row for row in dataset}
@@ -361,36 +417,37 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path,
     protocol.boundary.train()
     for epoch in range(epochs):
         order = torch.randperm(len(episodes), generator=generator).tolist()
-        for position in order:
-            episode = episodes[position]
-            row = rows_by_case[episode.query.case_id]
-            paths = ring_two_hop_branches(episode.source_id, num_agents)
-            leaf_rows = _pad([row["hospital_ids_all"][leaf] for leaf, _ in paths], tokenizer.pad_token_id)
-            relay_rows = _pad([row["hospital_ids_all"][relay] for _, relay in paths], tokenizer.pad_token_id)
-            source_tokens = row["hospital_ids_all"][episode.source_id] + row["host_question_ids"]
-            source_ids, source_mask = _pad([source_tokens], tokenizer.pad_token_id)
-            target_ids, _ = _pad([row["target_ids"]], tokenizer.pad_token_id)
-            target_labels = target_ids.clone()
-            target_labels[target_ids == tokenizer.pad_token_id] = IGNORE_INDEX
+        optimizer.zero_grad(set_to_none=True)
+        for start in range(0, len(order), batch_size):
+            batch = [episodes[position] for position in order[start:start + batch_size]]
+            paths = [graph_two_hop_branches(graph, episode.source_id) for episode in batch]
+            if any(len(route) != 2 for route in paths):
+                raise ValueError("pilot graph must provide two two-hop branches per source")
+            leaf_rows = _pad([rows_by_case[e.query.case_id]["hospital_ids_all"][leaf]
+                              for e, route in zip(batch, paths) for leaf, _ in route], tokenizer.pad_token_id)
+            relay_rows = _pad([rows_by_case[e.query.case_id]["hospital_ids_all"][relay]
+                               for e, route in zip(batch, paths) for _, relay in route], tokenizer.pad_token_id)
+            source_rows = [rows_by_case[e.query.case_id]["hospital_ids_all"][e.source_id]
+                           + rows_by_case[e.query.case_id]["host_question_ids"] for e in batch]
+            target_rows = [rows_by_case[e.query.case_id]["target_ids"] for e in batch]
+            source_ids, source_mask = _pad(source_rows, tokenizer.pad_token_id)
+            target_ids, _ = _pad(target_rows, tokenizer.pad_token_id)
+            target_labels = target_ids.masked_fill(target_ids == tokenizer.pad_token_id, IGNORE_INDEX)
             leaf_ids, leaf_mask = (item.to(resolved_device) for item in leaf_rows)
             relay_ids, relay_mask = (item.to(resolved_device) for item in relay_rows)
             source_ids, source_mask = source_ids.to(resolved_device), source_mask.to(resolved_device)
             target_ids, target_labels = target_ids.to(resolved_device), target_labels.to(resolved_device)
-            branch_blocks = two_hop_ring_blocks(
-                protocol, leaf_ids=leaf_ids, leaf_mask=leaf_mask,
-                relay_ids=relay_ids, relay_mask=relay_mask,
-            )
-            loss = protocol.source_loss(
-                source_ids, source_mask, target_ids, target_labels, branch_blocks,
-            )
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(protocol.distiller.parameters()) + list(protocol.boundary.parameters()), 1.0,
-            )
-            optimizer.step()
+            leaf_blocks = protocol.rollout(leaf_ids, leaf_mask)
+            relay_blocks = protocol.relay_rollout(relay_ids, relay_mask, [leaf_blocks], detach_children=True)
+            branch_blocks = tuple(select_kv_rows(relay_blocks, list(range(branch, len(batch) * 2, 2))) for branch in (0, 1))
+            loss = protocol.source_loss(source_ids, source_mask, target_ids, target_labels, branch_blocks)
+            (loss / gradient_accumulation_steps).backward()
             updates += 1
             last_loss = float(loss.detach().cpu())
+            if updates % gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(list(protocol.distiller.parameters()) + list(protocol.boundary.parameters()), 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             if max_steps and updates >= max_steps:
                 break
         if max_steps and updates >= max_steps:
@@ -399,11 +456,16 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path,
     output.mkdir(parents=True, exist_ok=True)
     save_distributed_latent_checkpoint(
         output / "distributed_latent_final.pt", protocol=protocol, model_name=model_name,
-        route={"num_agents": num_agents, "rounds": 4, "max_fanout": 2}, optimizer=optimizer,
+        route={"num_agents": num_agents, "rounds": 4, "max_fanout": 2, "R": 4, "k": 2, "m": num_latents,
+               "graph_seed": graph_seed, "pilot_hospital_ids": list(pilot_ids),
+               "graph_edges": [list(edge) for edge in graph.edge_list()], "split_paths": split_paths}, optimizer=optimizer,
         training={"seed": seed, "epochs": epoch + 1, "updates": updates, "last_loss": last_loss},
     )
     (output / "training_summary.json").write_text(json.dumps({
         "model_name": model_name, "num_agents": num_agents, "num_latents": num_latents,
+        "query_file": str(query_file), "hospital_dir": str(hospital_dir),
+        "pilot_hospital_ids": list(pilot_ids), "graph_edges": [list(edge) for edge in graph.edge_list()],
+        "split_paths": split_paths, "R": 4, "k": 2,
         "updates": updates, "last_loss": last_loss,
     }, indent=2) + "\n", encoding="utf-8")
     return {"updates": float(updates), "last_loss": last_loss}
@@ -413,7 +475,9 @@ LatentKVProtocol = DistributedLatentProtocol
 
 __all__ = [
     "KVBlock", "DistributedLatentProtocol", "LatentKVProtocol",
-    "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "kv_wire_bytes",
+    "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block", "kv_wire_bytes",
+    "batched_rollout", "batched_relay_aggregate",
     "ring_two_hop_branches", "two_hop_ring_blocks", "run_two_hop_ring_query",
+    "graph_two_hop_branches",
     "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",
 ]
