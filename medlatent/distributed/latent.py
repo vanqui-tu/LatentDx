@@ -246,6 +246,54 @@ class DistributedLatentProtocol:
         last = attention_mask.sum(dim=1).long() - 1
         return logits[torch.arange(input_ids.shape[0], device=input_ids.device), last]
 
+    def generate(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+                 branch_blocks: Sequence[KVBlock] = (), *, max_new_tokens: int = 64,
+                 eos_token_id: int | None = None, pad_token_id: int | None = None) -> torch.Tensor:
+        """Greedy batched generation from a source prompt and returned blocks."""
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
+        if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
+            raise ValueError("input_ids and attention_mask must both be [batch, sequence]")
+        past = merge_kv_blocks(tuple(branch_blocks))
+        prefix_len = 0 if past is None else past[0][0].shape[2]
+        prefix_mask = attention_mask.new_ones((input_ids.shape[0], prefix_len))
+        attention = torch.cat([prefix_mask, attention_mask], dim=1)
+        positions = _build_position_ids(prefix_mask, input_ids.shape[1])
+        decoder_kwargs = {
+            "input_ids": input_ids, "attention_mask": attention, "position_ids": positions,
+            "past_key_values": past, "use_cache": True, "return_dict": True,
+        }
+        if past is not None and self._requires_dynamic_cache(self.model):
+            decoder_kwargs["past_key_values"] = _to_dynamic_cache(past)
+        outputs = self.model(**decoder_kwargs)
+        cache = _as_block(outputs.past_key_values)
+        source_lengths = attention_mask.sum(dim=1).long()
+        rows = torch.arange(input_ids.shape[0], device=input_ids.device)
+        # CausalLM logits contain only the newly supplied source tokens;
+        # cached branch positions are not part of the returned sequence.
+        logits = outputs.logits[rows, source_lengths - 1, :]
+        generated: list[torch.Tensor] = []
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        for _ in range(max_new_tokens):
+            next_ids = logits.argmax(dim=-1)
+            if pad_token_id is not None:
+                next_ids = torch.where(finished, torch.full_like(next_ids, pad_token_id), next_ids)
+            generated.append(next_ids)
+            if eos_token_id is not None:
+                finished = finished | (next_ids == eos_token_id)
+                if bool(finished.all()):
+                    break
+            attention = torch.cat([attention, attention.new_ones((input_ids.shape[0], 1))], dim=1)
+            outputs = self.model(
+                input_ids=next_ids.unsqueeze(1), attention_mask=attention,
+                position_ids=_build_position_ids(attention[:, :-1], 1),
+                past_key_values=_to_dynamic_cache(cache) if self._requires_dynamic_cache(self.model) else cache,
+                use_cache=True, return_dict=True,
+            )
+            cache = _as_block(outputs.past_key_values)
+            logits = outputs.logits[:, -1, :]
+        return torch.stack(generated, dim=1) if generated else input_ids.new_empty((input_ids.shape[0], 0))
+
     def source_loss(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
                     target_ids: torch.Tensor, target_labels: torch.Tensor,
                     branch_blocks: Sequence[KVBlock] = ()) -> torch.Tensor:

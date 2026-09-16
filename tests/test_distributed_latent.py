@@ -67,6 +67,18 @@ def test_two_hop_rollout_reencodes_and_keeps_gradients():
     assert protocol.boundary.end.grad.abs().sum() > 0
 
 
+def test_batched_greedy_generation_handles_variable_source_lengths():
+    protocol = DistributedLatentProtocol(_Model(), LatentDistiller(4), BoundaryEmbeddings(4), num_latents=2)
+    ids = torch.tensor([[1, 2, 0], [3, 4, 5]])
+    mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
+    generated = protocol.generate(ids, mask, max_new_tokens=3, eos_token_id=None, pad_token_id=0)
+    assert generated.shape == (2, 3)
+
+    branch = protocol.rollout(torch.tensor([[1, 2], [3, 4]]), torch.ones((2, 2), dtype=torch.long))
+    generated_with_branch = protocol.generate(ids, mask, [branch], max_new_tokens=2, eos_token_id=None, pad_token_id=0)
+    assert generated_with_branch.shape == (2, 2)
+
+
 # NOTE: Unused - Legacy
 # def test_source_teacher_forcing_loss_uses_batched_branches():
 #     model = _Model()

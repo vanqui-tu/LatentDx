@@ -853,8 +853,7 @@ canonical result existed. Do not complete those tasks under their old scope.
   `m`. **DONE (2026-09-16; `DecentralizedMAS`: `python -m pytest -q` passed
   29 tests; q4r6 disjoint loader, seeded degree-3 shortcut graph, and batched
   local/relay KV smoke verified).**
-- [ ] **L3.2 - Train the shared local/relay latent operator.** IN PROGRESS
-  (2026-09-16; CPU fake-model verification complete, GPU q4r6 run pending).
+- [x] **L3.2 - Train the shared local/relay latent operator.**
   Freeze the
   Qwen3-4B backbone and train only the shared `LatentDistiller` plus boundary
   parameters on the five-agent pilot. Mix local encoding (`B_in = empty`) and
@@ -873,8 +872,10 @@ canonical result existed. Do not complete those tasks under their old scope.
   results, and checkpoint round-trip. **Done when:** tiny local and relay
   losses decrease, one real q4r6 run completes with finite loss, and the
   checkpoint reloads with model ID, `m`, pilot graph, route, split paths, and
-  optimizer/training metadata.
-- [ ] **L3.3 - Frozen pilot and network-expansion evaluation.** Freeze the L3.2
+  optimizer/training metadata. **DONE (2026-09-16; q4r6 pilot trained for one
+  epoch at `batch_size=4`, approximately 40 minutes, with loadable checkpoint).**
+- [ ] **L3.3 - Frozen pilot and network-expansion evaluation.** IN PROGRESS
+  (2026-09-16; evaluator implemented, GPU evaluation pending). Freeze the L3.2
   checkpoint and evaluate q4r6 `val.json`/`test.json` on the five-agent pilot,
   then on the ten-hospital retrieval directory without retraining the latent
   operator. Compare local-only, structured B2, text B2 where available, and
@@ -928,3 +929,4 @@ notes rather than expanding this table indefinitely.
 | 2026-09-16 | Implement q4r6 pilot substrate and batched KV operator | L3.1 | `DecentralizedMAS`: `python -m pytest -q` (29 passed); q4r6 disjoint loader and seeded shortcut graph smoke | Pilot IDs and split/route metadata are saved in the latent checkpoint manifest |
 | 2026-09-16 | Implement L3.2 training path | L3.2 | `DecentralizedMAS`: `python -m pytest -q` (32 passed); fake local/relay overfit and checkpoint tests passed | Effective batch size is fixed at 8 queries; run Qwen q4r6 smoke then full pilot training on A100 |
 | 2026-09-16 | Add L3.2 training progress logs | L3.2 | `DecentralizedMAS`: `python -m pytest -q` (32 passed) | Report data setup, tiny-overfit loss, and periodic optimizer-update loss |
+| 2026-09-16 | Implement frozen latent evaluator | L3.3 | `DecentralizedMAS`: `python -m pytest -q` (32 passed); variable-length KV generation smoke passed | Evaluate pilot and ten-hospital expansion with JSONL traces and summary metrics |
