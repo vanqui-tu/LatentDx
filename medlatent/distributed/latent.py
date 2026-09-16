@@ -10,6 +10,7 @@ child/branch order before a relay re-encodes them with its private prompt.
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -466,6 +467,8 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
     from .medical import load_medical_split, sample_balanced_sources, select_pilot_hospital_ids
     from .graph import shortcut_ring_graph
 
+    print(f"latent train: loading model={model_name} device={resolved_device}", flush=True)
+
     pilot_ids = select_pilot_hospital_ids(hospital_dir, num_agents=num_agents,
                                           pilot_hospital_ids=pilot_hospital_ids)
     graph = shortcut_ring_graph(num_agents, seed=graph_seed, num_shortcuts=1)
@@ -501,6 +504,17 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
         num_agents=num_agents, seed=seed,
     )
     rows_by_case = {row["case_id"]: row for row in dataset}
+    updates_per_epoch = math.ceil(len(episodes) / effective_batch_size)
+    total_updates = updates_per_epoch * epochs
+    if max_steps:
+        total_updates = min(total_updates, max_steps)
+    log_interval = max(1, total_updates // 20)
+    print(
+        f"latent train: episodes={len(episodes)} batch_size={batch_size} "
+        f"effective_batch_size={effective_batch_size} accumulation_steps={accumulation_steps} "
+        f"target_updates={total_updates}",
+        flush=True,
+    )
     optimizer = torch.optim.AdamW(
         list(protocol.distiller.parameters()) + list(protocol.boundary.parameters()),
         lr=learning_rate, weight_decay=weight_decay,
@@ -517,7 +531,16 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
     )
     initial_distiller = {name: value.detach().clone() for name, value in protocol.distiller.state_dict().items()}
     initial_boundary = {name: value.detach().clone() for name, value in protocol.boundary.state_dict().items()}
+    if tiny_overfit_steps:
+        print(f"latent train: tiny overfit steps={tiny_overfit_steps}", flush=True)
     tiny = tiny_overfit(protocol, optimizer, steps=tiny_overfit_steps, **tiny_batch)
+    if tiny_overfit_steps:
+        print(
+            "latent train: tiny overfit "
+            f"local={tiny['local_initial_loss']:.4f}->{tiny['local_final_loss']:.4f} "
+            f"relay={tiny['relay_initial_loss']:.4f}->{tiny['relay_final_loss']:.4f}",
+            flush=True,
+        )
     protocol.distiller.load_state_dict(initial_distiller)
     protocol.boundary.load_state_dict(initial_boundary)
     optimizer = torch.optim.AdamW(
@@ -552,6 +575,12 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
                 optimizer.zero_grad(set_to_none=True)
                 updates += 1
                 pending_micro_batches = 0
+                if updates == 1 or updates % log_interval == 0 or updates == total_updates:
+                    print(
+                        f"latent train: update={updates}/{total_updates} "
+                        f"loss={last_loss:.4f}",
+                        flush=True,
+                    )
             if max_steps and updates >= max_steps:
                 break
         if max_steps and updates >= max_steps:
