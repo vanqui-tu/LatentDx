@@ -95,17 +95,31 @@ def ring_two_hop_branches(source_id: int, num_agents: int) -> tuple[tuple[int, i
 
 
 def graph_two_hop_branches(graph: Any, source_id: int, *, max_branches: int = 2) -> tuple[tuple[int, int], ...]:
-    """Select deterministic two-hop branches from an arbitrary pilot graph."""
+    """Select deterministic node-disjoint two-hop branches from a pilot graph."""
     if max_branches <= 0:
         raise ValueError("max_branches must be positive")
+    from itertools import combinations
+
     source_neighbors = set(graph.neighbors(source_id))
-    candidates = []
+    candidates: list[tuple[bool, int, int]] = []
     for relay in graph.neighbors(source_id):
         leaves = tuple(neighbor for neighbor in graph.neighbors(relay) if neighbor != source_id)
-        if leaves:
-            leaf = min(leaves, key=lambda node: (node in source_neighbors, node))
-            candidates.append((leaf in source_neighbors, relay, leaf))
-    return tuple((leaf, relay) for _, relay, leaf in sorted(candidates)[:max_branches])
+        candidates.extend((leaf in source_neighbors, relay, leaf) for leaf in leaves)
+
+    ordered = sorted(candidates)
+    for branch_count in range(min(max_branches, len(source_neighbors)), 0, -1):
+        valid = []
+        for choice in combinations(ordered, branch_count):
+            relays = {relay for _, relay, _ in choice}
+            leaves = {leaf for _, _, leaf in choice}
+            if len(relays) != branch_count or len(leaves) != branch_count or not relays.isdisjoint(leaves):
+                continue
+            routes = tuple(sorted((relay, leaf) for _, relay, leaf in choice))
+            valid.append((sum(int(is_direct) for is_direct, _, _ in choice), routes))
+        if valid:
+            _, routes = min(valid)
+            return tuple((leaf, relay) for relay, leaf in routes)
+    return ()
 
 
 class DistributedLatentProtocol:
@@ -241,12 +255,26 @@ class DistributedLatentProtocol:
         if input_ids.shape[0] != target_ids.shape[0]:
             raise ValueError("source and target batches must have the same size")
         target_mask = (target_labels != IGNORE_INDEX).long()
-        full_ids = torch.cat([input_ids, target_ids], dim=1)
-        full_mask = torch.cat([attention_mask, target_mask], dim=1)
+        source_lengths = attention_mask.sum(dim=1).long()
+        if torch.any(source_lengths <= 0):
+            raise ValueError("each source row must contain at least one token")
+
+        # Move valid target tokens directly after each row's valid source tokens.
+        # This keeps one batched forward without placing the answer after source PADs.
+        raw_ids = torch.cat([input_ids, target_ids], dim=1)
+        raw_mask = torch.cat([attention_mask, target_mask], dim=1)
+        order = torch.argsort((raw_mask == 0).to(torch.int8), dim=1, stable=True)
+        full_ids = raw_ids.gather(1, order)
+        full_mask = raw_mask.gather(1, order)
         logits = self._source_sequence_logits(full_ids, full_mask, branch_blocks)
-        source_width = input_ids.shape[1]
-        first = logits[:, source_width - 1, :]
-        target_logits = logits[:, source_width:source_width + target_ids.shape[1], :]
+        rows = torch.arange(input_ids.shape[0], device=input_ids.device)
+        first = logits[rows, source_lengths - 1, :]
+        target_positions = source_lengths.unsqueeze(1) + torch.arange(
+            target_ids.shape[1], device=input_ids.device,
+        ).unsqueeze(0)
+        target_logits = logits.gather(
+            1, target_positions.unsqueeze(-1).expand(-1, -1, logits.shape[-1]),
+        )
         return diagnosis_cross_entropy(first, target_logits, target_labels, ignore_index=IGNORE_INDEX)
 
     def _source_sequence_logits(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
@@ -286,25 +314,24 @@ class DistributedLatentProtocol:
             logits = self.model(**decoder_kwargs).logits
         return logits
 
+# NOTE: Unused - Legacy
+# def two_hop_ring_blocks(protocol: DistributedLatentProtocol, *, leaf_ids: torch.Tensor,
+#                         leaf_mask: torch.Tensor, relay_ids: torch.Tensor,
+#                         relay_mask: torch.Tensor) -> tuple[KVBlock, KVBlock]:
+#     """Return the two final branch summaries from batched leaf/relay passes."""
+#     if leaf_ids.shape[0] != 2 or relay_ids.shape[0] != 2:
+#         raise ValueError("leaf and relay batches must contain the two ring branches")
+#     leaf_blocks = protocol.rollout(leaf_ids, leaf_mask)
+#     relay_blocks = protocol.relay_rollout(relay_ids, relay_mask, [leaf_blocks], detach_children=False)
+#     return select_kv_rows(relay_blocks, 0), select_kv_rows(relay_blocks, 1)
 
-def two_hop_ring_blocks(protocol: DistributedLatentProtocol, *, leaf_ids: torch.Tensor,
-                        leaf_mask: torch.Tensor, relay_ids: torch.Tensor,
-                        relay_mask: torch.Tensor) -> tuple[KVBlock, KVBlock]:
-    """Return the two final branch summaries from batched leaf/relay passes."""
-    if leaf_ids.shape[0] != 2 or relay_ids.shape[0] != 2:
-        raise ValueError("leaf and relay batches must contain the two ring branches")
-    leaf_blocks = protocol.rollout(leaf_ids, leaf_mask)
-    relay_blocks = protocol.relay_rollout(relay_ids, relay_mask, [leaf_blocks], detach_children=False)
-    return select_kv_rows(relay_blocks, 0), select_kv_rows(relay_blocks, 1)
-
-
-def run_two_hop_ring_query(protocol: DistributedLatentProtocol, *, source_ids: torch.Tensor,
-                           source_mask: torch.Tensor, leaf_ids: torch.Tensor, leaf_mask: torch.Tensor,
-                           relay_ids: torch.Tensor, relay_mask: torch.Tensor) -> torch.Tensor:
-    """Run one query with two hospitals batched at each fixed ring hop."""
-    branches = two_hop_ring_blocks(protocol, leaf_ids=leaf_ids, leaf_mask=leaf_mask,
-                                   relay_ids=relay_ids, relay_mask=relay_mask)
-    return protocol.source_logits(source_ids, source_mask, branches)
+# def run_two_hop_ring_query(protocol: DistributedLatentProtocol, *, source_ids: torch.Tensor,
+#                            source_mask: torch.Tensor, leaf_ids: torch.Tensor, leaf_mask: torch.Tensor,
+#                            relay_ids: torch.Tensor, relay_mask: torch.Tensor) -> torch.Tensor:
+#     """Run one query with two hospitals batched at each fixed ring hop."""
+#     branches = two_hop_ring_blocks(protocol, leaf_ids=leaf_ids, leaf_mask=leaf_mask,
+#                                    relay_ids=relay_ids, relay_mask=relay_mask)
+#     return protocol.source_logits(source_ids, source_mask, branches)
 
 
 def batched_rollout(protocol: DistributedLatentProtocol, input_ids: torch.Tensor,
@@ -331,11 +358,12 @@ def batched_pilot_loss(
     batch_size = source_ids.shape[0]
     if leaf_ids.shape[0] != batch_size * 2 or relay_ids.shape[0] != batch_size * 2:
         raise ValueError("leaf and relay rows must contain two branches per source row")
-    leaf_blocks = protocol.rollout(leaf_ids, leaf_mask)
-    final_blocks = (
-        protocol.relay_rollout(relay_ids, relay_mask, [leaf_blocks], detach_children=True)
-        if use_relay else leaf_blocks
-    )
+    if use_relay:
+        with torch.no_grad():
+            leaf_blocks = protocol.rollout(leaf_ids, leaf_mask)
+        final_blocks = protocol.relay_rollout(relay_ids, relay_mask, [leaf_blocks], detach_children=True)
+    else:
+        final_blocks = protocol.rollout(leaf_ids, leaf_mask)
     branches = tuple(
         select_kv_rows(final_blocks, list(range(branch, batch_size * 2, 2)))
         for branch in (0, 1)
@@ -391,11 +419,11 @@ def _pilot_batch_tensors(*, episodes: Sequence[Any], rows_by_case: Mapping[str, 
     leaf_ids, leaf_mask = _pad(leaf_rows, pad_token_id)
     relay_ids, relay_mask = _pad(relay_rows, pad_token_id)
     source_ids, source_mask = _pad(source_rows, pad_token_id)
-    target_ids, _ = _pad(target_rows, pad_token_id)
+    target_ids, target_mask = _pad(target_rows, pad_token_id)
     return {
         "source_ids": source_ids.to(device), "source_mask": source_mask.to(device),
         "target_ids": target_ids.to(device),
-        "target_labels": target_ids.masked_fill(target_ids == pad_token_id, IGNORE_INDEX).to(device),
+        "target_labels": target_ids.masked_fill(target_mask == 0, IGNORE_INDEX).to(device),
         "leaf_ids": leaf_ids.to(device), "leaf_mask": leaf_mask.to(device),
         "relay_ids": relay_ids.to(device), "relay_mask": relay_mask.to(device),
     }
@@ -618,7 +646,6 @@ __all__ = [
     "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block", "kv_wire_bytes",
     "batched_rollout", "batched_relay_aggregate",
     "accumulation_steps_for",
-    "ring_two_hop_branches", "two_hop_ring_blocks", "run_two_hop_ring_query",
-    "graph_two_hop_branches",
+    "ring_two_hop_branches", "graph_two_hop_branches",
     "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",
 ]
