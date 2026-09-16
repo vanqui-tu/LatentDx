@@ -17,10 +17,10 @@ from .medical_baselines import MedicalBaselineKind, MedicalBaselineResult, run_m
 from .messages import MessageEnvelope, MessageKind, ProposalPayload, RequestPayload, TextProposalPayload, TextRequestPayload
 from .textmas import TextGeneration, TextGenerator, TransformersTextGenerator, VllmTextGenerator, build_agent_prompt, build_host_prompt, parse_textmas_answer
 from .latent import (
-    DistributedLatentProtocol, KVBlock, LatentKVProtocol, batched_relay_aggregate, batched_rollout,
+    DistributedLatentProtocol, KVBlock, LatentKVProtocol, accumulation_steps_for, batched_pilot_loss, batched_relay_aggregate, batched_rollout,
     detach_kv_block, kv_wire_bytes, load_distributed_latent_checkpoint,
     graph_two_hop_branches, merge_kv_blocks, ring_two_hop_branches, run_two_hop_ring_query, save_distributed_latent_checkpoint,
-    select_kv_rows, slice_kv_block, train_distributed_latent_real, two_hop_ring_blocks,
+    select_kv_rows, slice_kv_block, tiny_overfit, train_distributed_latent_real, two_hop_ring_blocks,
 )
 
 __all__ = [
@@ -36,7 +36,7 @@ __all__ = [
     "MedicalBaselineKind", "MedicalBaselineResult", "run_medical_baseline",
     "TextGeneration", "TextGenerator", "TransformersTextGenerator", "VllmTextGenerator", "build_agent_prompt", "build_host_prompt", "parse_textmas_answer",
     "DistributedLatentProtocol", "LatentKVProtocol", "KVBlock", "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block",
-    "batched_rollout", "batched_relay_aggregate", "kv_wire_bytes",
+    "batched_rollout", "batched_relay_aggregate", "batched_pilot_loss", "tiny_overfit", "accumulation_steps_for", "kv_wire_bytes",
     "ring_two_hop_branches", "two_hop_ring_blocks", "run_two_hop_ring_query",
     "graph_two_hop_branches",
     "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",

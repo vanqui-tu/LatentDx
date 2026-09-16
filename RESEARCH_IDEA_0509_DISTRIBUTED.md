@@ -853,7 +853,9 @@ canonical result existed. Do not complete those tasks under their old scope.
   `m`. **DONE (2026-09-16; `DecentralizedMAS`: `python -m pytest -q` passed
   29 tests; q4r6 disjoint loader, seeded degree-3 shortcut graph, and batched
   local/relay KV smoke verified).**
-- [ ] **L3.2 - Train the shared local/relay latent operator.** Freeze the
+- [ ] **L3.2 - Train the shared local/relay latent operator.** IN PROGRESS
+  (2026-09-16; CPU fake-model verification complete, GPU q4r6 run pending).
+  Freeze the
   Qwen3-4B backbone and train only the shared `LatentDistiller` plus boundary
   parameters on the five-agent pilot. Mix local encoding (`B_in = empty`) and
   relay aggregation (`B_in = detached or cached child block`); do not
@@ -924,3 +926,4 @@ notes rather than expanding this table indefinitely.
 | 2026-09-13 | Start fixed-route latent training path | L3.3 | `DecentralizedMAS`: latent focused tests (3 passed), full suite (26 passed) | One query at a time; two ring branches batched per hop; new `train_distributed_latent.py` checkpoint entrypoint |
 | 2026-09-16 | Replace M3 with q4r6 batched pilot plan | L3.1-L3.3 | Documentation-only; q4r6 query/retrieval split inspected; five-agent shortcut-ring pilot selected | Train shared local/relay operator with detached or cached child blocks; evaluate frozen checkpoint on ten-hospital expansion |
 | 2026-09-16 | Implement q4r6 pilot substrate and batched KV operator | L3.1 | `DecentralizedMAS`: `python -m pytest -q` (29 passed); q4r6 disjoint loader and seeded shortcut graph smoke | Pilot IDs and split/route metadata are saved in the latent checkpoint manifest |
+| 2026-09-16 | Implement L3.2 training path | L3.2 | `DecentralizedMAS`: `python -m pytest -q` (32 passed); fake local/relay overfit and checkpoint tests passed | Effective batch size is fixed at 8 queries; run Qwen q4r6 smoke then full pilot training on A100 |

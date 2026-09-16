@@ -24,8 +24,9 @@ def main() -> None:
     parser.add_argument("--pilot_hospital_ids", type=int, nargs="+", default=None)
     parser.add_argument("--num_agents", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--effective_batch_size", type=int, default=8)
     parser.add_argument("--graph_seed", type=int, default=42)
+    parser.add_argument("--tiny_overfit_steps", type=int, default=16)
     parser.add_argument("--num_latents", type=int, default=8)
     parser.add_argument("--max_prompt_length", type=int, default=320)
     parser.add_argument("--max_target_length", type=int, default=64)
@@ -46,15 +47,16 @@ def main() -> None:
         output_dir=args.output_dir, hpo_embeddings_file=args.hpo_embeddings_file,
         hpo_ic_file=args.hpo_ic_file, num_latents=args.num_latents,
         num_agents=args.num_agents, pilot_hospital_ids=args.pilot_hospital_ids,
-        batch_size=args.batch_size, gradient_accumulation_steps=args.gradient_accumulation_steps,
-        graph_seed=args.graph_seed,
+        batch_size=args.batch_size, effective_batch_size=args.effective_batch_size,
+        graph_seed=args.graph_seed, tiny_overfit_steps=args.tiny_overfit_steps,
         max_prompt_length=args.max_prompt_length, max_target_length=args.max_target_length,
         epochs=args.epochs, max_steps=args.max_steps, learning_rate=args.learning_rate,
         weight_decay=args.weight_decay, seed=args.seed, device=args.device, dtype=args.dtype,
         local_files_only=args.local_files_only,
     )
     print(f"distributed latent training complete: output_dir={args.output_dir} "
-          f"updates={int(summary['updates'])} loss={summary['last_loss']:.4f}")
+          f"updates={int(summary['updates'])} loss={summary['last_loss']:.4f} "
+          f"time={summary['elapsed_seconds']:.1f}s peak_memory={int(summary['peak_memory_bytes'])}")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,10 @@
 import torch
+import pytest
 
 from medlatent.distributed.latent import (
-    DistributedLatentProtocol, load_distributed_latent_checkpoint, merge_kv_blocks,
-    batched_relay_aggregate, batched_rollout, ring_two_hop_branches, save_distributed_latent_checkpoint, slice_kv_block,
-    two_hop_ring_blocks,
+    DistributedLatentProtocol, accumulation_steps_for, batched_pilot_loss, load_distributed_latent_checkpoint, merge_kv_blocks,
+    batched_relay_aggregate, batched_rollout, ring_two_hop_branches, save_distributed_latent_checkpoint,
+    slice_kv_block, tiny_overfit, two_hop_ring_blocks,
 )
 from medlatent.modules import BoundaryEmbeddings, LatentDistiller
 
@@ -102,6 +103,48 @@ def test_batched_local_and_relay_operator_detaches_children():
     assert torch.autograd.grad(relay[0][0].sum(), local[0][0], allow_unused=True) == (None,)
 
 
+def _pilot_tensors():
+    source_ids = torch.tensor([[1, 2]])
+    leaf_ids = torch.tensor([[1, 2], [3, 4]])
+    return dict(
+        source_ids=source_ids, source_mask=torch.ones_like(source_ids),
+        target_ids=torch.tensor([[3, 4]]), target_labels=torch.tensor([[3, 4]]),
+        leaf_ids=leaf_ids, leaf_mask=torch.ones_like(leaf_ids),
+        relay_ids=leaf_ids, relay_mask=torch.ones_like(leaf_ids),
+    )
+
+
+def test_effective_batch_size_matches_medlatent_h_accumulation_semantics():
+    assert accumulation_steps_for(batch_size=1, effective_batch_size=8) == 8
+    assert accumulation_steps_for(batch_size=2, effective_batch_size=8) == 4
+    assert accumulation_steps_for(batch_size=4, effective_batch_size=8) == 2
+    with pytest.raises(ValueError, match="divisible"):
+        accumulation_steps_for(batch_size=3, effective_batch_size=8)
+
+
+def test_pilot_loss_only_updates_active_interface_parameters():
+    protocol = DistributedLatentProtocol(_Model(), LatentDistiller(4), BoundaryEmbeddings(4), num_latents=2)
+    first = batched_pilot_loss(protocol, use_relay=True, **_pilot_tensors())
+    second = batched_pilot_loss(protocol, use_relay=True, **_pilot_tensors())
+    assert torch.allclose(first, second)
+    first.backward()
+
+    assert protocol.distiller.projection[1].weight.grad.abs().sum() > 0
+    assert protocol.boundary.begin.grad.abs().sum() > 0
+    assert protocol.boundary.end.grad.abs().sum() > 0
+    assert all(parameter.grad is None for parameter in protocol.model.parameters())
+
+
+def test_tiny_overfit_reduces_local_and_relay_losses_deterministically():
+    torch.manual_seed(0)
+    protocol = DistributedLatentProtocol(_Model(), LatentDistiller(4), BoundaryEmbeddings(4), num_latents=2)
+    optimizer = torch.optim.AdamW([*protocol.distiller.parameters(), *protocol.boundary.parameters()], lr=0.05)
+    result = tiny_overfit(protocol, optimizer, steps=20, **_pilot_tensors())
+
+    assert result["local_final_loss"] < result["local_initial_loss"]
+    assert result["relay_final_loss"] < result["relay_initial_loss"]
+
+
 def test_fixed_route_and_checkpoint_metadata(tmp_path):
     assert ring_two_hop_branches(0, 10) == ((2, 1), (8, 9))
     model = _Model()
@@ -109,10 +152,14 @@ def test_fixed_route_and_checkpoint_metadata(tmp_path):
     optimizer = torch.optim.AdamW(list(protocol.distiller.parameters()) + list(protocol.boundary.parameters()))
     path = tmp_path / "distributed_latent.pt"
     save_distributed_latent_checkpoint(
-        path, protocol=protocol, model_name="fake/model", route={"num_agents": 10, "rounds": 4, "max_fanout": 2},
-        optimizer=optimizer, training={"updates": 0},
+        path, protocol=protocol, model_name="fake/model",
+        route={"num_agents": 5, "R": 4, "k": 2, "m": 2, "pilot_hospital_ids": [0, 1, 2, 3, 4],
+               "graph_edges": [[0, 1]], "split_paths": {"train": "train.json"}},
+        optimizer=optimizer, training={"updates": 1, "tiny_overfit": {"local_final_loss": 1.0}},
     )
     payload = load_distributed_latent_checkpoint(path)
     assert payload["module_type"] == "DistributedLatentKV"
     assert payload["num_latents"] == 2
-    assert payload["route"]["num_agents"] == 10
+    assert payload["route"]["num_agents"] == 5
+    assert payload["route"]["pilot_hospital_ids"] == [0, 1, 2, 3, 4]
+    assert payload["training"]["tiny_overfit"]["local_final_loss"] == 1.0
