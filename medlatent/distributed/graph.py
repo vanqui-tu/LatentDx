@@ -148,6 +148,43 @@ def validate_graph_constraints(graph: CommunicationGraph, *, max_degree: int | N
             raise ValueError(f"graph degree exceeds max_degree={bound}")
 
 
+def extend_graph(
+    base_graph: CommunicationGraph, num_agents: int, *, seed: int = 42, max_degree: int = 3,
+) -> CommunicationGraph:
+    """Extend a pilot graph without changing its existing induced subgraph.
+
+    New nodes are connected as a deterministic path and the path is attached
+    once to an existing node with spare degree. Existing edges are copied
+    verbatim; no new edge is added between old nodes.
+    """
+    if not isinstance(base_graph, CommunicationGraph):
+        raise TypeError("base_graph must be a CommunicationGraph")
+    count = _num_agents(num_agents)
+    if count < base_graph.num_agents:
+        raise ValueError("num_agents must be at least base_graph.num_agents")
+    bound = _nonnegative(max_degree, "max_degree")
+    if any(len(base_graph.neighbors(agent_id)) > bound for agent_id in base_graph.agent_ids):
+        raise ValueError("base_graph already exceeds max_degree")
+    if count == base_graph.num_agents:
+        return base_graph
+    adjacency = np.zeros((count, count), dtype=np.bool_)
+    adjacency[:base_graph.num_agents, :base_graph.num_agents] = base_graph.adjacency
+    new_ids = list(range(base_graph.num_agents, count))
+    for left, right in zip(new_ids, new_ids[1:]):
+        adjacency[left, right] = adjacency[right, left] = True
+    available = [agent_id for agent_id in base_graph.agent_ids if len(base_graph.neighbors(agent_id)) < bound]
+    if not available:
+        raise ValueError("base_graph has no node with spare degree for extension")
+    import random
+
+    anchor = random.Random(_nonnegative(seed, "seed")).choice(available)
+    first = new_ids[0]
+    adjacency[anchor, first] = adjacency[first, anchor] = True
+    extended = CommunicationGraph(adjacency)
+    validate_graph_constraints(extended, max_degree=bound)
+    return extended
+
+
 def erdos_renyi_graph(num_agents: int, edge_probability: float, *, seed: int, connectivity: str = "allow_disconnected") -> CommunicationGraph:
     """Build a seeded Erdos-Renyi graph using optional NetworkX."""
     count = _num_agents(num_agents)

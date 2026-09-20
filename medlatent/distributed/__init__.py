@@ -3,7 +3,7 @@
 from .agent import AgentEpisodeState, AgentRuntime, PrivateKnowledgeStore
 from .channels import StructuredChannel, TextChannel
 from .episode import EpisodeEvent, EpisodeResult, SynchronousEpisodeEngine
-from .graph import (CommunicationGraph, complete_graph, erdos_renyi_graph, path_graph, ring_graph,
+from .graph import (CommunicationGraph, complete_graph, erdos_renyi_graph, extend_graph, path_graph, ring_graph,
                     seeded_shortcut_ring_graph, shortcut_ring_graph, stochastic_block_model_graph,
                     validate_graph_constraints, watts_strogatz_graph)
 from .medical import (
@@ -25,7 +25,7 @@ from .latent import (
 
 __all__ = [
     "AgentEpisodeState", "AgentRuntime", "PrivateKnowledgeStore",
-    "CommunicationGraph", "complete_graph", "path_graph", "ring_graph", "shortcut_ring_graph", "seeded_shortcut_ring_graph",
+    "CommunicationGraph", "complete_graph", "extend_graph", "path_graph", "ring_graph", "shortcut_ring_graph", "seeded_shortcut_ring_graph",
     "validate_graph_constraints", "erdos_renyi_graph", "watts_strogatz_graph", "stochastic_block_model_graph",
     "MessageEnvelope", "MessageKind", "ProposalPayload", "RequestPayload", "TextProposalPayload", "TextRequestPayload",
     "EpisodeEvent", "EpisodeResult", "SynchronousEpisodeEngine", "StructuredChannel", "TextChannel",

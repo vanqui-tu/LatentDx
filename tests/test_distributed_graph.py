@@ -7,6 +7,7 @@ from medlatent.distributed import (
     erdos_renyi_graph,
     path_graph,
     ring_graph,
+    extend_graph,
     shortcut_ring_graph,
     stochastic_block_model_graph,
     watts_strogatz_graph,
@@ -33,6 +34,15 @@ def test_seeded_shortcut_ring_is_bounded_and_reproducible():
     assert np.array_equal(first.adjacency, second.adjacency)
     assert set(ring_graph(5).edge_list()).issubset(set(first.edge_list()))
     assert max(len(first.neighbors(agent_id)) for agent_id in first.agent_ids) <= 3
+
+
+def test_graph_extension_preserves_pilot_edges_and_adds_connected_nodes():
+    pilot = shortcut_ring_graph(5, seed=42)
+    extended = extend_graph(pilot, 10, seed=42)
+    assert np.array_equal(extended.adjacency[:5, :5], pilot.adjacency)
+    assert len(extended.edge_list()) > len(pilot.edge_list())
+    assert all(extended.shortest_path_length(0, node) is not None for node in extended.agent_ids)
+    assert max(len(extended.neighbors(node)) for node in extended.agent_ids) <= 3
 
 
 def test_optional_graph_generators_are_seeded_and_return_current_graph_type():

@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from medlatent.distributed import (  # noqa: E402
     DistributedLatentProtocol,
+    CommunicationGraph,
+    extend_graph,
     graph_two_hop_branches,
     load_hospital_private_stores,
     load_distributed_latent_checkpoint,
@@ -24,7 +26,6 @@ from medlatent.distributed import (  # noqa: E402
     prediction_matches_target,
     sample_balanced_sources,
     select_kv_rows,
-    shortcut_ring_graph,
 )
 from medlatent.distributed.latent import _pilot_batch_tensors  # noqa: E402
 from medlatent.hf_data import MedLatentDiagnosisDataset  # noqa: E402
@@ -200,13 +201,28 @@ def main() -> None:
         max_prompt_length=args.max_prompt_length, max_target_length=args.max_target_length,
         hpo_embeddings_file=args.hpo_embeddings_file, hpo_ic_file=args.hpo_ic_file,
     )
-    episodes = sample_balanced_sources(load_medical_split(args.query_file), split=args.query_file.stem,
-                                       num_agents=num_agents, seed=args.seed)
+    source_agent_count = pilot_count = len(pilot_ids)
+    episodes = sample_balanced_sources(
+        load_medical_split(args.query_file), split=args.query_file.stem,
+        num_agents=source_agent_count if num_agents > source_agent_count else num_agents,
+        seed=args.seed,
+    )
     if args.max_samples:
         episodes = episodes[:args.max_samples]
     rows_by_case = {row["case_id"]: row for row in dataset}
     graph_seed = int(route.get("graph_seed", 42))
-    graph = shortcut_ring_graph(num_agents, seed=graph_seed, num_shortcuts=1)
+    pilot_edges = tuple(tuple(int(value) for value in edge) for edge in route.get("graph_edges", ()))
+    if len(pilot_edges) != 0:
+        pilot_adjacency = torch.zeros((pilot_count, pilot_count), dtype=torch.bool).numpy()
+        for left, right in pilot_edges:
+            if left >= pilot_count or right >= pilot_count or left == right:
+                parser.error("checkpoint pilot graph contains invalid edge")
+            pilot_adjacency[left, right] = pilot_adjacency[right, left] = True
+        pilot_graph = CommunicationGraph(pilot_adjacency)
+    else:
+        from medlatent.distributed import shortcut_ring_graph
+        pilot_graph = shortcut_ring_graph(pilot_count, seed=graph_seed, num_shortcuts=1)
+    graph = extend_graph(pilot_graph, num_agents, seed=graph_seed) if num_agents > pilot_count else pilot_graph
     stores = load_hospital_private_stores(
         args.hospital_dir, num_agents=num_agents, hospital_ids=selected_ids,
         hpo_embeddings_file=args.hpo_embeddings_file, hpo_ic_file=args.hpo_ic_file,
@@ -243,7 +259,10 @@ def main() -> None:
         "checkpoint_sha256": _sha256(args.checkpoint), "query_file": str(args.query_file),
         "hospital_dir": str(args.hospital_dir), "num_agents": num_agents,
         "hospital_ids": list(selected_ids), "pilot_hospital_ids": list(pilot_ids),
+        "source_assignment_agents": source_agent_count if num_agents > source_agent_count else num_agents,
         "graph_seed": graph_seed, "graph_edges": [list(edge) for edge in graph.edge_list()],
+        "pilot_graph_edges": [list(edge) for edge in pilot_graph.edge_list()],
+        "graph_extension_preserves_pilot": set(pilot_graph.edge_list()).issubset(set(graph.edge_list())),
         "R": int(route.get("R", 4)), "k": int(route.get("k", 2)),
         "m": int(payload["num_latents"]), "episodes": len(episodes),
         "peak_memory_bytes": peak_memory, "methods": summaries,
