@@ -41,6 +41,7 @@ def test_graph_extension_preserves_pilot_edges_and_adds_connected_nodes():
     extended = extend_graph(pilot, 10, seed=42)
     assert np.array_equal(extended.adjacency[:5, :5], pilot.adjacency)
     assert len(extended.edge_list()) > len(pilot.edge_list())
+    assert all(1 <= len(extended.neighbors(node)) <= 3 for node in range(5, 10))
     assert all(extended.shortest_path_length(0, node) is not None for node in extended.agent_ids)
     assert max(len(extended.neighbors(node)) for node in extended.agent_ids) <= 3
 

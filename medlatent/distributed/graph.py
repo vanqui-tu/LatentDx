@@ -153,9 +153,9 @@ def extend_graph(
 ) -> CommunicationGraph:
     """Extend a pilot graph without changing its existing induced subgraph.
 
-    New nodes are connected as a deterministic path and the path is attached
-    once to an existing node with spare degree. Existing edges are copied
-    verbatim; no new edge is added between old nodes.
+    Each new node is added in order with one guaranteed connection to the
+    already connected graph and a seeded optional second connection. Existing
+    edges are copied verbatim; no new edge is added between old nodes.
     """
     if not isinstance(base_graph, CommunicationGraph):
         raise TypeError("base_graph must be a CommunicationGraph")
@@ -169,17 +169,23 @@ def extend_graph(
         return base_graph
     adjacency = np.zeros((count, count), dtype=np.bool_)
     adjacency[:base_graph.num_agents, :base_graph.num_agents] = base_graph.adjacency
-    new_ids = list(range(base_graph.num_agents, count))
-    for left, right in zip(new_ids, new_ids[1:]):
-        adjacency[left, right] = adjacency[right, left] = True
-    available = [agent_id for agent_id in base_graph.agent_ids if len(base_graph.neighbors(agent_id)) < bound]
-    if not available:
-        raise ValueError("base_graph has no node with spare degree for extension")
     import random
 
-    anchor = random.Random(_nonnegative(seed, "seed")).choice(available)
-    first = new_ids[0]
-    adjacency[anchor, first] = adjacency[first, anchor] = True
+    rng = random.Random(_nonnegative(seed, "seed"))
+    new_ids = list(range(base_graph.num_agents, count))
+    for new_id in new_ids:
+        candidates = [
+            agent_id for agent_id in range(new_id)
+            if int(adjacency[agent_id].sum()) < bound
+        ]
+        if not candidates:
+            raise ValueError("no degree capacity remains for a connected extension")
+        parent = rng.choice(candidates)
+        adjacency[parent, new_id] = adjacency[new_id, parent] = True
+        extra_candidates = [agent_id for agent_id in candidates if agent_id != parent]
+        if extra_candidates and rng.choice((False, True)):
+            extra = rng.choice(extra_candidates)
+            adjacency[extra, new_id] = adjacency[new_id, extra] = True
     extended = CommunicationGraph(adjacency)
     validate_graph_constraints(extended, max_degree=bound)
     return extended
