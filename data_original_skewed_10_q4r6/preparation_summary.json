@@ -1,0 +1,35 @@
+{
+  "output_dir": "data_original_skewed_10_q4r6",
+  "partition_strategy": "skewed",
+  "seed": 42,
+  "split_sizes": {
+    "train": 4332,
+    "val": 401,
+    "test": 401
+  },
+  "hospital_sizes": [
+    395,
+    485,
+    450,
+    392,
+    388,
+    372,
+    494,
+    413,
+    557,
+    386
+  ],
+  "unmapped_disease_ids": {
+    "OMIM:601674": 13,
+    "OMIM:621193": 6
+  },
+  "unmapped_phenotype_ids": {
+    "HP:0006957": 1,
+    "HP:0025848": 2,
+    "HP:0035023": 8,
+    "HP:5200320": 1,
+    "HP:6000236": 1,
+    "HP:6000980": 1,
+    "HP:6001114": 2
+  }
+}
