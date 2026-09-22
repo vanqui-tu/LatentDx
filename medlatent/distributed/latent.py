@@ -484,18 +484,26 @@ class NodeLocalLatentTrainer:
 
     def train_episode(self, episode: Any, *, mode: str,
                       incoming: Sequence[KVBlock] = ()) -> tuple[float, KVBlock]:
+        return self.train_batch((episode,), mode=mode, incoming=incoming)
+
+    def train_batch(self, episodes: Sequence[Any], *, mode: str,
+                    incoming: Sequence[KVBlock] = ()) -> tuple[float, KVBlock]:
+        """Train one node on a batch of same-route episodes."""
         from ..hf_data import _pad
         from .medical import build_agent_prompt_batch
 
-        row = build_agent_prompt_batch(
-            (episode,), self.store, hospital_id=self.hospital_id, tokenizer=self.tokenizer,
+        episodes = tuple(episodes)
+        if not episodes:
+            raise ValueError("episodes must not be empty")
+        rows = build_agent_prompt_batch(
+            episodes, self.store, hospital_id=self.hospital_id, tokenizer=self.tokenizer,
             max_prompt_length=self.max_prompt_length, max_target_length=self.max_target_length,
-        )[0]
-        local_rows = [row["local_ids"]]
-        source_rows = [row["local_ids"] + row["host_question_ids"]]
+        )
+        local_rows = [row["local_ids"] for row in rows]
+        source_rows = [row["local_ids"] + row["host_question_ids"] for row in rows]
         local_ids, local_mask = _pad(local_rows, self.tokenizer.pad_token_id)
         source_ids, source_mask = _pad(source_rows, self.tokenizer.pad_token_id)
-        target_ids, target_mask = _pad([row["target_ids"]], self.tokenizer.pad_token_id)
+        target_ids, target_mask = _pad([row["target_ids"] for row in rows], self.tokenizer.pad_token_id)
         target_labels = target_ids.masked_fill(target_mask == 0, IGNORE_INDEX)
         local_ids = local_ids.to(self.device)
         local_mask = local_mask.to(self.device)
@@ -793,7 +801,7 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
                                   weight_decay: float = 0.01, seed: int = 42,
                                   device: str = "cuda", dtype: str = "bfloat16",
                                   local_files_only: bool = False,
-                                  training_mode: str = "centralized", local_steps: int = 1,
+                                  training_mode: str = "centralized", local_steps: int = 0,
                                   sync_interval: int = 32) -> dict[str, float]:
     """Train the centralized M3 operator or decentralized local replicas."""
     query_file = query_file or train_file
@@ -801,8 +809,8 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
         raise ValueError("query_file is required")
     if training_mode not in {"centralized", "decentralized"}:
         raise ValueError("training_mode must be 'centralized' or 'decentralized'")
-    if local_steps <= 0:
-        raise ValueError("local_steps must be positive")
+    if local_steps < 0:
+        raise ValueError("local_steps must be non-negative")
     if sync_interval <= 0:
         raise ValueError("sync_interval must be positive")
     if num_agents != 5:
@@ -851,7 +859,8 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
             pilot_ids=pilot_ids, split_paths=split_paths, hospital_dir=hospital_dir,
             hpo_embeddings_file=hpo_embeddings_file, hpo_ic_file=hpo_ic_file,
             num_latents=num_latents, learning_rate=learning_rate,
-            weight_decay=weight_decay, local_steps=local_steps, seed=seed,
+            weight_decay=weight_decay, local_steps=local_steps, epochs=epochs,
+            batch_size=batch_size, seed=seed,
             sync_interval=sync_interval,
             max_prompt_length=max_prompt_length, max_target_length=max_target_length,
             device=resolved_device,
@@ -983,11 +992,23 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
                                hpo_embeddings_file: str | Path, hpo_ic_file: str | Path,
                                num_latents: int,
                                learning_rate: float, weight_decay: float, local_steps: int,
-                               seed: int, sync_interval: int, max_prompt_length: int, max_target_length: int,
+                               epochs: int, batch_size: int, seed: int, sync_interval: int,
+                               max_prompt_length: int, max_target_length: int,
                                device: torch.device) -> dict[str, float]:
     """Run isolated node updates; no loss is formed over all private prompts."""
     if not episodes:
         raise ValueError("decentralized training requires at least one episode")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    total_episodes = local_steps if local_steps > 0 else len(episodes) * epochs
+    scheduled = [episodes[index % len(episodes)] for index in range(total_episodes)]
+    grouped: dict[int, list[Any]] = {}
+    for episode in scheduled:
+        grouped.setdefault(episode.source_id, []).append(episode)
+    batches = [grouped[source][start:start + batch_size]
+               for source in sorted(grouped)
+               for start in range(0, len(grouped[source]), batch_size)]
+    total_steps = len(batches)
     hidden_size = int(model.config.hidden_size)
     dtype = model.get_input_embeddings().weight.dtype
     from .medical import load_hospital_private_stores
@@ -1023,12 +1044,12 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
     mixing_weights = metropolis_mixing_weights(graph)
     log_interval = max(1, sync_interval)
     print(
-        f"decentralized train: episodes={len(episodes)} nodes={len(nodes)} "
-        f"local_steps={local_steps} sync_interval={sync_interval}",
+        f"decentralized train: episodes={total_episodes} batches={total_steps} "
+        f"batch_size={batch_size} nodes={len(nodes)} epochs={epochs} sync_interval={sync_interval}",
         flush=True,
     )
-    for step in range(local_steps):
-        episode = episodes[step % len(episodes)]
+    for step, batch in enumerate(batches):
+        episode = batch[0]
         order, parent = graph_broadcast_tree(graph, episode.source_id, max_fanout=2)
         outgoing: dict[int, KVBlock] = {}
         step_losses: list[float] = []
@@ -1039,8 +1060,8 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
             else:
                 mode = "relay"
                 incoming = (outgoing[parent[node_id]],)
-            loss, block = trainers[node_id].train_episode(
-                episode, mode=mode, incoming=incoming,
+            loss, block = trainers[node_id].train_batch(
+                batch, mode=mode, incoming=incoming,
             )
             losses.append(loss)
             step_losses.append(loss)
@@ -1048,11 +1069,12 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
         if (step + 1) % sync_interval == 0:
             mixing_weights = gossip_node_interfaces(nodes, graph, mixing_weights=mixing_weights)
             gossip_rounds += 1
-        if step == 0 or (step + 1) % log_interval == 0 or step + 1 == local_steps:
+        if step == 0 or (step + 1) % log_interval == 0 or step + 1 == total_steps:
             gossip_note = f" gossip_round={gossip_rounds}" if (step + 1) % sync_interval == 0 else ""
             print(
-                f"decentralized train: step={step + 1}/{local_steps} "
-                f"source={episode.source_id} mean_loss={sum(step_losses) / len(step_losses):.4f}{gossip_note}",
+                f"decentralized train: step={step + 1}/{total_steps} "
+                f"source={episode.source_id} mean_loss={sum(step_losses) / len(step_losses):.4f} "
+                f"elapsed={time.perf_counter() - start_time:.1f}s{gossip_note}",
                 flush=True,
             )
     elapsed_seconds = time.perf_counter() - start_time
@@ -1066,7 +1088,8 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
                "split_paths": dict(split_paths)},
         gossip={"rounds": gossip_rounds, "sync_interval": sync_interval,
                 "mixing_weights": {agent_id: dict(row) for agent_id, row in mixing_weights.items()}},
-        training={"mode": "decentralized", "local_steps": local_steps,
+        training={"mode": "decentralized", "epochs": epochs, "batch_size": batch_size,
+                  "local_steps": local_steps, "total_steps": total_steps,
                   "sync_interval": sync_interval, "seed": seed, "updates": len(losses),
                   "last_loss": losses[-1] if losses else float("nan"),
                   "elapsed_seconds": elapsed_seconds},

@@ -41,7 +41,8 @@ def main() -> None:
     parser.add_argument("--training_mode", choices=("centralized", "decentralized"), default="centralized")
     parser.add_argument("--decentralized", action="store_true",
                         help="short alias for --training_mode decentralized")
-    parser.add_argument("--local_steps", type=int, default=1)
+    parser.add_argument("--local_steps", type=int, default=0,
+                        help="override episode steps; 0 means epochs * train episodes")
     parser.add_argument("--sync_interval", type=int, default=32,
                         help="decentralized local steps between graph gossip rounds")
     args = parser.parse_args()

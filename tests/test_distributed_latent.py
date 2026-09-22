@@ -10,6 +10,8 @@ from medlatent.distributed.latent import (
 )
 from medlatent.modules import BoundaryEmbeddings, LatentDistiller
 from medlatent.distributed.graph import path_graph, ring_graph
+from medlatent.distributed.latent import NodeLocalLatentTrainer
+from medlatent.distributed.medical import MedicalEpisode, MedicalQuery, MedicalRetrievedRecord
 
 
 class _Output:
@@ -261,3 +263,34 @@ def test_broadcast_tree_follows_graph_from_episode_source():
     order, parent = graph_broadcast_tree(path_graph(5), source_id=2)
     assert order == (2, 1, 3, 0, 4)
     assert parent == {2: None, 1: 2, 3: 2, 0: 1, 4: 3}
+
+
+def test_node_local_trainer_batches_local_and_relay_queries():
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token = ""
+
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+            return " ".join(message["content"] for message in messages)
+
+        def __call__(self, text, *, add_special_tokens, truncation, max_length):
+            return {"input_ids": [((ord(char) % 7) + 1) for char in text[:max_length]] or [1]}
+
+    class Store:
+        def retrieve(self, query, *, limit):
+            return (MedicalRetrievedRecord("record", "Disease", "phenotype", 1.0),)
+
+    episodes = tuple(
+        MedicalEpisode("train", MedicalQuery(f"q{index}", ("HP:1",), "phenotype"), "Disease", 0)
+        for index in range(2)
+    )
+    model = _Model()
+    first = DecentralizedLatentNode(0, model, 4, num_latents=2)
+    second = DecentralizedLatentNode(1, model, 4, num_latents=2)
+    trainer0 = NodeLocalLatentTrainer(first, Store(), tokenizer=Tokenizer(), hospital_id=0)
+    trainer1 = NodeLocalLatentTrainer(second, Store(), tokenizer=Tokenizer(), hospital_id=1)
+    _, child = trainer0.train_batch(episodes, mode="local")
+    loss, relay = trainer1.train_batch(episodes, mode="relay", incoming=(child,))
+    assert loss >= 0
+    assert relay[0][0].shape[0] == 2
+    assert not relay[0][0].requires_grad
