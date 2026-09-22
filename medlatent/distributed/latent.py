@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections import deque
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -390,7 +391,9 @@ class DecentralizedLatentNode:
         self.protocol = DistributedLatentProtocol(
             model, self.distiller, self.boundary, num_latents=num_latents,
         )
-        self.optimizer = torch.optim.AdamW(
+        # Gossip synchronizes parameters only; zero-momentum SGD avoids stale
+        # Adam moments after a peer average.
+        self.optimizer = torch.optim.SGD(
             [*self.distiller.parameters(), *self.boundary.parameters()],
             lr=learning_rate, weight_decay=weight_decay,
         )
@@ -442,6 +445,77 @@ class DecentralizedLatentNode:
             "distiller": self.distiller.state(),
             "boundary": self.boundary.state(),
         }
+
+
+def graph_broadcast_tree(graph: Any, source_id: int, *, max_fanout: int = 2) -> tuple[tuple[int, ...], dict[int, int | None]]:
+    """Return a deterministic BFS tree with bounded per-node fan-out."""
+    if source_id not in graph.agent_ids:
+        raise ValueError(f"invalid source_id: {source_id}")
+    if max_fanout <= 0:
+        raise ValueError("max_fanout must be positive")
+    parent: dict[int, int | None] = {source_id: None}
+    order: list[int] = []
+    queue = deque([source_id])
+    while queue:
+        current = queue.popleft()
+        order.append(current)
+        unvisited = [neighbor for neighbor in graph.neighbors(current) if neighbor not in parent]
+        for neighbor in unvisited[:max_fanout]:
+            parent[neighbor] = current
+            queue.append(neighbor)
+    if len(parent) != graph.num_agents:
+        raise ValueError("training route requires a connected graph")
+    return tuple(order), parent
+
+
+class NodeLocalLatentTrainer:
+    """Own one private store and build one node-local training example."""
+
+    def __init__(self, node: DecentralizedLatentNode, store: Any, *, tokenizer: Any,
+                 hospital_id: int, max_prompt_length: int = 320,
+                 max_target_length: int = 64, device: torch.device | str = "cpu"):
+        self.node = node
+        self.store = store
+        self.tokenizer = tokenizer
+        self.hospital_id = int(hospital_id)
+        self.max_prompt_length = int(max_prompt_length)
+        self.max_target_length = int(max_target_length)
+        self.device = torch.device(device)
+
+    def train_episode(self, episode: Any, *, mode: str,
+                      incoming: Sequence[KVBlock] = ()) -> tuple[float, KVBlock]:
+        from ..hf_data import _pad
+        from .medical import build_agent_prompt_batch
+
+        row = build_agent_prompt_batch(
+            (episode,), self.store, hospital_id=self.hospital_id, tokenizer=self.tokenizer,
+            max_prompt_length=self.max_prompt_length, max_target_length=self.max_target_length,
+        )[0]
+        local_rows = [row["local_ids"]]
+        source_rows = [row["local_ids"] + row["host_question_ids"]]
+        local_ids, local_mask = _pad(local_rows, self.tokenizer.pad_token_id)
+        source_ids, source_mask = _pad(source_rows, self.tokenizer.pad_token_id)
+        target_ids, target_mask = _pad([row["target_ids"]], self.tokenizer.pad_token_id)
+        target_labels = target_ids.masked_fill(target_mask == 0, IGNORE_INDEX)
+        local_ids = local_ids.to(self.device)
+        local_mask = local_mask.to(self.device)
+        source_ids = source_ids.to(self.device)
+        source_mask = source_mask.to(self.device)
+        target_ids = target_ids.to(self.device)
+        target_labels = target_labels.to(self.device)
+        loss = self.node.train_step(
+            mode=mode, local_ids=local_ids, local_mask=local_mask,
+            source_ids=source_ids, source_mask=source_mask,
+            target_ids=target_ids, target_labels=target_labels, incoming=incoming,
+        )
+        with torch.no_grad():
+            if mode == "local":
+                outgoing = self.node.protocol.rollout(local_ids, local_mask)
+            else:
+                outgoing = self.node.protocol.relay_rollout(
+                    local_ids, local_mask, incoming, detach_children=True,
+                )
+        return loss, outgoing
 
 
 def metropolis_mixing_weights(graph: Any) -> dict[int, dict[int, float]]:
@@ -720,7 +794,7 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
                                   device: str = "cuda", dtype: str = "bfloat16",
                                   local_files_only: bool = False,
                                   training_mode: str = "centralized", local_steps: int = 1,
-                                  sync_interval: int = 1) -> dict[str, float]:
+                                  sync_interval: int = 32) -> dict[str, float]:
     """Train the centralized M3 operator or decentralized local replicas."""
     query_file = query_file or train_file
     if query_file is None:
@@ -916,51 +990,53 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
         raise ValueError("decentralized training requires at least one episode")
     hidden_size = int(model.config.hidden_size)
     dtype = model.get_input_embeddings().weight.dtype
-    nodes = {
-        node_id: DecentralizedLatentNode(
+    from .medical import load_hospital_private_stores
+    reference = DecentralizedLatentNode(
+        0, model, hidden_size, num_latents=num_latents,
+        device=device, dtype=dtype, learning_rate=learning_rate,
+        weight_decay=weight_decay,
+    )
+    nodes = {0: reference}
+    for node_id in range(1, len(pilot_ids)):
+        node = DecentralizedLatentNode(
             node_id, model, hidden_size, num_latents=num_latents,
             device=device, dtype=dtype, learning_rate=learning_rate,
             weight_decay=weight_decay,
         )
-        for node_id in range(len(pilot_ids))
-    }
-    from ..hf_data import _pad
-    from .medical import build_agent_prompt_batch, load_hospital_private_stores
+        node.distiller.load_state_dict(reference.distiller.state_dict())
+        node.boundary.load_state_dict(reference.boundary.state_dict())
+        nodes[node_id] = node
+    trainers = {}
+    for node_id in nodes:
+        local_store = load_hospital_private_stores(
+            hospital_dir, num_agents=1, hospital_ids=[pilot_ids[node_id]],
+            hpo_embeddings_file=hpo_embeddings_file, hpo_ic_file=hpo_ic_file,
+        )[0]
+        trainers[node_id] = NodeLocalLatentTrainer(
+            nodes[node_id], local_store, tokenizer=tokenizer,
+            hospital_id=pilot_ids[node_id], max_prompt_length=max_prompt_length,
+            max_target_length=max_target_length, device=device,
+        )
     start_time = time.perf_counter()
     losses: list[float] = []
     gossip_rounds = 0
     mixing_weights = metropolis_mixing_weights(graph)
     for step in range(local_steps):
         episode = episodes[step % len(episodes)]
-        source_row = build_agent_prompt_batch(
-            (episode,), load_hospital_private_stores(
-                hospital_dir, num_agents=1, hospital_ids=[pilot_ids[episode.source_id]],
-                hpo_embeddings_file=hpo_embeddings_file, hpo_ic_file=hpo_ic_file,
-            )[0], hospital_id=pilot_ids[episode.source_id], tokenizer=tokenizer,
-            max_prompt_length=max_prompt_length, max_target_length=max_target_length,
-        )[0]
-        source_ids, source_mask = _pad([source_row["host_question_ids"]], tokenizer.pad_token_id)
-        target_ids, target_mask = _pad([source_row["target_ids"]], tokenizer.pad_token_id)
-        target_labels = target_ids.masked_fill(target_mask == 0, IGNORE_INDEX)
-        incoming: KVBlock | None = None
-        for node_id, node in nodes.items():
-            local_row = build_agent_prompt_batch(
-                (episode,), load_hospital_private_stores(
-                    hospital_dir, num_agents=1, hospital_ids=[pilot_ids[node_id]],
-                    hpo_embeddings_file=hpo_embeddings_file, hpo_ic_file=hpo_ic_file,
-                )[0], hospital_id=pilot_ids[node_id], tokenizer=tokenizer,
-                max_prompt_length=max_prompt_length, max_target_length=max_target_length,
-            )[0]
-            local_ids, local_mask = _pad([local_row["local_ids"]], tokenizer.pad_token_id)
-            mode = "local" if incoming is None else "relay"
-            losses.append(node.train_step(
-                mode=mode, local_ids=local_ids.to(device), local_mask=local_mask.to(device),
-                source_ids=source_ids.to(device), source_mask=source_mask.to(device),
-                target_ids=target_ids.to(device), target_labels=target_labels.to(device),
-                incoming=() if incoming is None else (incoming,),
-            ))
-            with torch.no_grad():
-                incoming = node.protocol.rollout(local_ids.to(device), local_mask.to(device))
+        order, parent = graph_broadcast_tree(graph, episode.source_id, max_fanout=2)
+        outgoing: dict[int, KVBlock] = {}
+        for node_id in order:
+            if node_id == episode.source_id:
+                mode = "local"
+                incoming = ()
+            else:
+                mode = "relay"
+                incoming = (outgoing[parent[node_id]],)
+            loss, block = trainers[node_id].train_episode(
+                episode, mode=mode, incoming=incoming,
+            )
+            losses.append(loss)
+            outgoing[node_id] = block
         if (step + 1) % sync_interval == 0:
             mixing_weights = gossip_node_interfaces(nodes, graph, mixing_weights=mixing_weights)
             gossip_rounds += 1
@@ -969,7 +1045,7 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
     output.mkdir(parents=True, exist_ok=True)
     save_decentralized_latent_checkpoint(
         output / "distributed_latent_decentralized.pt", nodes=nodes, model_name=model_name,
-        route={"num_agents": len(nodes), "R": 4, "k": 2,
+        route={"num_agents": len(nodes), "R": 4, "k": 2, "max_fanout": 2,
                "pilot_hospital_ids": list(pilot_ids),
                "graph_edges": [list(edge) for edge in graph.edge_list()],
                "split_paths": dict(split_paths)},
@@ -988,11 +1064,11 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
 LatentKVProtocol = DistributedLatentProtocol
 
 __all__ = [
-    "KVBlock", "DistributedLatentProtocol", "DecentralizedLatentNode", "LatentKVProtocol",
+    "KVBlock", "DistributedLatentProtocol", "DecentralizedLatentNode", "NodeLocalLatentTrainer", "LatentKVProtocol",
     "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block", "kv_wire_bytes",
     "batched_rollout", "batched_relay_aggregate",
     "accumulation_steps_for",
-    "ring_two_hop_branches", "graph_two_hop_branches",
+    "ring_two_hop_branches", "graph_two_hop_branches", "graph_broadcast_tree",
     "metropolis_mixing_weights", "gossip_node_interfaces", "interface_consensus_distance",
     "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",
     "save_decentralized_latent_checkpoint", "load_decentralized_latent_checkpoint",

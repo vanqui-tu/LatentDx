@@ -3,7 +3,7 @@ import pytest
 
 from medlatent.distributed.latent import (
     DecentralizedLatentNode, DistributedLatentProtocol, accumulation_steps_for, batched_pilot_loss, gossip_node_interfaces,
-    interface_consensus_distance, load_decentralized_latent_checkpoint, load_distributed_latent_checkpoint,
+    graph_broadcast_tree, interface_consensus_distance, load_decentralized_latent_checkpoint, load_distributed_latent_checkpoint,
     merge_kv_blocks, metropolis_mixing_weights, save_decentralized_latent_checkpoint,
     batched_relay_aggregate, batched_rollout, ring_two_hop_branches, save_distributed_latent_checkpoint,
     slice_kv_block, tiny_overfit,
@@ -255,3 +255,9 @@ def test_decentralized_checkpoint_keeps_node_and_gossip_metadata(tmp_path):
     assert sorted(payload["nodes"]) == [0, 1]
     assert payload["gossip"]["rounds"] == 1
     assert payload["training"]["seed"] == 42
+
+
+def test_broadcast_tree_follows_graph_from_episode_source():
+    order, parent = graph_broadcast_tree(path_graph(5), source_id=2)
+    assert order == (2, 1, 3, 0, 4)
+    assert parent == {2: None, 1: 2, 3: 2, 0: 1, 4: 3}

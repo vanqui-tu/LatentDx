@@ -42,7 +42,7 @@ def main() -> None:
     parser.add_argument("--decentralized", action="store_true",
                         help="short alias for --training_mode decentralized")
     parser.add_argument("--local_steps", type=int, default=1)
-    parser.add_argument("--sync_interval", type=int, default=1,
+    parser.add_argument("--sync_interval", type=int, default=32,
                         help="decentralized local steps between graph gossip rounds")
     args = parser.parse_args()
     query_file = args.query_file or args.train_file

@@ -912,7 +912,7 @@ canonical result existed. Do not complete those tasks under their old scope.
 
 ### 15.5 M4 - Decentralized latent-interface training
 
-- [x] **L4.1 - Local training replicas and privacy boundary.** Replace the
+- [ ] **L4.1 - Local training replicas and privacy boundary.** Replace the
   single shared M3 distiller with one local `LatentDistiller` and boundary copy
   per pilot agent while keeping the Qwen backbone frozen. Reuse the q4r6 query
   split and five-agent seeded shortcut graph; each node must construct local
@@ -926,9 +926,9 @@ canonical result existed. Do not complete those tasks under their old scope.
   tests cover local-only data flow, detached incoming blocks, frozen backbone,
   and identical parameter shapes across nodes. **Done when:** a five-node CPU
   smoke runs one local and one relay update per node with no central loss over
-  all private stores. **DONE (2026-09-22; five-node CPU smoke and full suite
-  passed).**
-- [x] **L4.2 - Peer-to-peer synchronization.** Implement periodic graph gossip
+  all private stores. **REOPENED (2026-09-22 review):** the trainer must use
+  graph-routed relay outputs and node-local store ownership before completion.
+- [ ] **L4.2 - Peer-to-peer synchronization.** Implement periodic graph gossip
   for only the trainable distiller/boundary state (or compact deltas), with no
   parameter server and no central gradient aggregation. Start with deterministic
   weighted neighbor averaging; optionally add a local consensus penalty, but do
@@ -939,8 +939,9 @@ canonical result existed. Do not complete those tasks under their old scope.
   steps and sync interval; add tests for symmetric mixing, reproducibility,
   state-shape validation, and consensus-distance reduction. **Done when:** all
   nodes can train and synchronize over the fixed graph, no central model is
-  required after initialization, and local losses remain finite. **DONE
-  (2026-09-22; deterministic Metropolis gossip and CPU tests passed).**
+  required after initialization, and local losses remain finite. **REOPENED
+  (2026-09-22 review):** verify gossip after the corrected node-local route and
+  initialization/optimizer semantics.
 - [ ] **L4.3 - Decentralized evaluation and ablations.** Compare M4 with the
   M3 centralized checkpoint/oracle and independent local distillers on the same
   q4r6 pilot and held-out queries. Keep inference fixed: local encoding and
@@ -972,6 +973,8 @@ notes rather than expanding this table indefinitely.
 
 | Date | Session/work | Tasks | Verification/evidence | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-22 | Reopen L4.1/L4.2 after architecture review | L4.1, L4.2 | Initial implementation had ID-ordered relay, source retrieval omission, central orchestration, and unsynchronized Adam state | Corrected path is graph-routed node-local training with source evidence, shared initialization, and SGD before re-verification |
+| 2026-09-22 | Correct graph-routed local training path | L4.1, L4.2 | `DecentralizedMAS`: focused latent tests (13 passed), full suite (39 passed); all shortcut-graph sources reach five nodes with fanout <= 2 | BFS parent tree, node-owned stores/trainers, source local evidence, shared initialization, and SGD are implemented; tasks remain open pending broader decentralized training validation |
 | 2026-09-22 | Implement graph gossip synchronization | L4.2 | `DecentralizedMAS`: `python -m pytest -q` (38 passed) | Symmetric Metropolis mixing, atomic node-state updates, sync interval CLI, and checkpoint gossip metadata; no parameter server |
 | 2026-09-22 | Implement local latent replicas and privacy boundary | L4.1 | `DecentralizedMAS`: `python -m pytest -q` (35 passed) | Per-node distiller/boundary, explicit local/relay updates with detached incoming KV, agent-local retrieval/prompt batches, and decentralized CLI mode; backbone remains frozen |
 | 2026-09-22 | Promote decentralized latent training to M4 | M4 planning | Documentation-only; M3 retained as centralized oracle and M4 defined as local replicas plus graph gossip | Keep local/relay modes, frozen backbone, fixed sparse graph, and no learned routing |

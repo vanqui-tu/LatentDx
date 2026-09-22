@@ -17,10 +17,10 @@ from .medical_baselines import MedicalBaselineKind, MedicalBaselineResult, run_m
 from .messages import MessageEnvelope, MessageKind, ProposalPayload, RequestPayload, TextProposalPayload, TextRequestPayload
 from .textmas import TextGeneration, TextGenerator, TransformersTextGenerator, VllmTextGenerator, build_agent_prompt, build_host_prompt, parse_textmas_answer
 from .latent import (
-    DecentralizedLatentNode, DistributedLatentProtocol, KVBlock, LatentKVProtocol, accumulation_steps_for, batched_pilot_loss, batched_relay_aggregate, batched_rollout,
+    DecentralizedLatentNode, DistributedLatentProtocol, KVBlock, LatentKVProtocol, NodeLocalLatentTrainer, accumulation_steps_for, batched_pilot_loss, batched_relay_aggregate, batched_rollout,
     detach_kv_block, gossip_node_interfaces, interface_consensus_distance, kv_wire_bytes,
     load_decentralized_latent_checkpoint, load_distributed_latent_checkpoint, metropolis_mixing_weights,
-    graph_two_hop_branches, merge_kv_blocks, ring_two_hop_branches, save_distributed_latent_checkpoint,
+    graph_broadcast_tree, graph_two_hop_branches, merge_kv_blocks, ring_two_hop_branches, save_distributed_latent_checkpoint,
     save_decentralized_latent_checkpoint, select_kv_rows, slice_kv_block, tiny_overfit, train_distributed_latent_real
 )
 
@@ -36,9 +36,9 @@ __all__ = [
     "prediction_matches_target", "sample_balanced_sources", "select_pilot_hospital_ids", "build_agent_query_batch", "build_agent_prompt_batch", "build_agent_retrieval_batch",
     "MedicalBaselineKind", "MedicalBaselineResult", "run_medical_baseline",
     "TextGeneration", "TextGenerator", "TransformersTextGenerator", "VllmTextGenerator", "build_agent_prompt", "build_host_prompt", "parse_textmas_answer",
-    "DistributedLatentProtocol", "DecentralizedLatentNode", "LatentKVProtocol", "KVBlock", "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block",
+    "DistributedLatentProtocol", "DecentralizedLatentNode", "NodeLocalLatentTrainer", "LatentKVProtocol", "KVBlock", "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block",
     "batched_rollout", "batched_relay_aggregate", "batched_pilot_loss", "tiny_overfit", "accumulation_steps_for", "kv_wire_bytes",
-    "ring_two_hop_branches", "graph_two_hop_branches",
+    "ring_two_hop_branches", "graph_two_hop_branches", "graph_broadcast_tree",
     "metropolis_mixing_weights", "gossip_node_interfaces", "interface_consensus_distance",
     "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",
     "save_decentralized_latent_checkpoint", "load_decentralized_latent_checkpoint",
