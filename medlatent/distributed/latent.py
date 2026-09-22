@@ -1021,10 +1021,17 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
     losses: list[float] = []
     gossip_rounds = 0
     mixing_weights = metropolis_mixing_weights(graph)
+    log_interval = max(1, sync_interval)
+    print(
+        f"decentralized train: episodes={len(episodes)} nodes={len(nodes)} "
+        f"local_steps={local_steps} sync_interval={sync_interval}",
+        flush=True,
+    )
     for step in range(local_steps):
         episode = episodes[step % len(episodes)]
         order, parent = graph_broadcast_tree(graph, episode.source_id, max_fanout=2)
         outgoing: dict[int, KVBlock] = {}
+        step_losses: list[float] = []
         for node_id in order:
             if node_id == episode.source_id:
                 mode = "local"
@@ -1036,10 +1043,18 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
                 episode, mode=mode, incoming=incoming,
             )
             losses.append(loss)
+            step_losses.append(loss)
             outgoing[node_id] = block
         if (step + 1) % sync_interval == 0:
             mixing_weights = gossip_node_interfaces(nodes, graph, mixing_weights=mixing_weights)
             gossip_rounds += 1
+        if step == 0 or (step + 1) % log_interval == 0 or step + 1 == local_steps:
+            gossip_note = f" gossip_round={gossip_rounds}" if (step + 1) % sync_interval == 0 else ""
+            print(
+                f"decentralized train: step={step + 1}/{local_steps} "
+                f"source={episode.source_id} mean_loss={sum(step_losses) / len(step_losses):.4f}{gossip_note}",
+                flush=True,
+            )
     elapsed_seconds = time.perf_counter() - start_time
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
