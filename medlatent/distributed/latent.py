@@ -362,6 +362,87 @@ class DistributedLatentProtocol:
             logits = self.model(**decoder_kwargs).logits
         return logits
 
+
+class DecentralizedLatentNode:
+    """One agent's trainable latent interface over a shared frozen backbone.
+
+    The node owns its distiller, boundary embeddings, and optimizer.  Incoming
+    child blocks are treated as transport inputs and detached at the relay
+    boundary, so a node update never backpropagates into another node.
+    """
+
+    def __init__(self, node_id: int, model: torch.nn.Module, hidden_size: int,
+                 *, num_latents: int = 8, device: torch.device | str | None = None,
+                 dtype: torch.dtype | None = None, learning_rate: float = 1e-4,
+                 weight_decay: float = 0.01):
+        if isinstance(node_id, bool) or node_id < 0:
+            raise ValueError("node_id must be a non-negative integer")
+        if hidden_size <= 0:
+            raise ValueError("hidden_size must be positive")
+        self.node_id = int(node_id)
+        module_kwargs = {}
+        if device is not None:
+            module_kwargs["device"] = device
+        if dtype is not None:
+            module_kwargs["dtype"] = dtype
+        self.distiller = LatentDistiller(hidden_size).to(**module_kwargs)
+        self.boundary = BoundaryEmbeddings(hidden_size).to(**module_kwargs)
+        self.protocol = DistributedLatentProtocol(
+            model, self.distiller, self.boundary, num_latents=num_latents,
+        )
+        self.optimizer = torch.optim.AdamW(
+            [*self.distiller.parameters(), *self.boundary.parameters()],
+            lr=learning_rate, weight_decay=weight_decay,
+        )
+
+    @property
+    def parameters(self):
+        return tuple(self.distiller.parameters()) + tuple(self.boundary.parameters())
+
+    def loss(self, *, mode: str, local_ids: torch.Tensor, local_mask: torch.Tensor,
+             source_ids: torch.Tensor, source_mask: torch.Tensor,
+             target_ids: torch.Tensor, target_labels: torch.Tensor,
+             incoming: Sequence[KVBlock] = ()) -> torch.Tensor:
+        """Compute one node-local diagnosis loss in explicit local/relay mode."""
+        if mode == "local":
+            if incoming:
+                raise ValueError("local mode cannot receive incoming blocks")
+            block = self.protocol.rollout(local_ids, local_mask, ())
+        elif mode == "relay":
+            block = self.protocol.relay_rollout(
+                local_ids, local_mask, incoming, detach_children=True,
+            )
+        else:
+            raise ValueError("mode must be 'local' or 'relay'")
+        return self.protocol.source_loss(
+            source_ids, source_mask, target_ids, target_labels, (block,)
+        )
+
+    def train_step(self, *, mode: str, local_ids: torch.Tensor,
+                   local_mask: torch.Tensor, source_ids: torch.Tensor,
+                   source_mask: torch.Tensor, target_ids: torch.Tensor,
+                   target_labels: torch.Tensor, incoming: Sequence[KVBlock] = ()) -> float:
+        """Run one isolated optimizer update and return its detached loss."""
+        self.distiller.train()
+        self.boundary.train()
+        self.optimizer.zero_grad(set_to_none=True)
+        loss = self.loss(
+            mode=mode, local_ids=local_ids, local_mask=local_mask,
+            source_ids=source_ids, source_mask=source_mask,
+            target_ids=target_ids, target_labels=target_labels, incoming=incoming,
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters, 1.0)
+        self.optimizer.step()
+        return float(loss.detach().cpu())
+
+    def state(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "distiller": self.distiller.state(),
+            "boundary": self.boundary.state(),
+        }
+
 # NOTE: Unused - Legacy
 # def two_hop_ring_blocks(protocol: DistributedLatentProtocol, *, leaf_ids: torch.Tensor,
 #                         leaf_mask: torch.Tensor, relay_ids: torch.Tensor,
@@ -523,11 +604,16 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
                                   epochs: int = 1, max_steps: int = 0, learning_rate: float = 1e-4,
                                   weight_decay: float = 0.01, seed: int = 42,
                                   device: str = "cuda", dtype: str = "bfloat16",
-                                  local_files_only: bool = False) -> dict[str, float]:
+                                  local_files_only: bool = False,
+                                  training_mode: str = "centralized", local_steps: int = 1) -> dict[str, float]:
     """Train the shared operator on padded local/relay batches."""
     query_file = query_file or train_file
     if query_file is None:
         raise ValueError("query_file is required")
+    if training_mode not in {"centralized", "decentralized"}:
+        raise ValueError("training_mode must be 'centralized' or 'decentralized'")
+    if local_steps <= 0:
+        raise ValueError("local_steps must be positive")
     if num_agents != 5:
         raise ValueError("the M3 pilot currently requires num_agents=5")
     if epochs <= 0 or max_steps < 0 or tiny_overfit_steps < 0:
@@ -563,6 +649,21 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
         model_name, trust_remote_code=True, local_files_only=local_files_only,
         torch_dtype=torch_dtype,
     ).to(resolved_device)
+    episodes = sample_balanced_sources(
+        load_medical_split(query_file), split=Path(query_file).stem,
+        num_agents=num_agents, seed=seed,
+    )
+    if training_mode == "decentralized":
+        return _train_decentralized_nodes(
+            model=model, model_name=model_name, tokenizer=tokenizer,
+            episodes=episodes, output_dir=output_dir, graph=graph,
+            pilot_ids=pilot_ids, split_paths=split_paths, hospital_dir=hospital_dir,
+            hpo_embeddings_file=hpo_embeddings_file, hpo_ic_file=hpo_ic_file,
+            num_latents=num_latents, learning_rate=learning_rate,
+            weight_decay=weight_decay, local_steps=local_steps, seed=seed,
+            max_prompt_length=max_prompt_length, max_target_length=max_target_length,
+            device=resolved_device,
+        )
     protocol = DistributedLatentProtocol(
         model,
         LatentDistiller(int(model.config.hidden_size)).to(device=resolved_device, dtype=torch_dtype),
@@ -574,10 +675,6 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
         num_hospitals=num_agents, max_prompt_length=max_prompt_length,
         max_target_length=max_target_length, hpo_embeddings_file=hpo_embeddings_file,
         hpo_ic_file=hpo_ic_file, hospital_ids=list(pilot_ids),
-    )
-    episodes = sample_balanced_sources(
-        load_medical_split(query_file), split=Path(query_file).stem,
-        num_agents=num_agents, seed=seed,
     )
     rows_by_case = {row["case_id"]: row for row in dataset}
     updates_per_epoch = math.ceil(len(episodes) / effective_batch_size)
@@ -687,10 +784,89 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
             "elapsed_seconds": elapsed_seconds, "peak_memory_bytes": float(peak_memory_bytes)}
 
 
+def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, tokenizer: Any,
+                               episodes: Sequence[Any],
+                               output_dir: str | Path, graph: Any, pilot_ids: Sequence[int],
+                               split_paths: Mapping[str, str], hospital_dir: str | Path,
+                               hpo_embeddings_file: str | Path, hpo_ic_file: str | Path,
+                               num_latents: int,
+                               learning_rate: float, weight_decay: float, local_steps: int,
+                               seed: int, max_prompt_length: int, max_target_length: int,
+                               device: torch.device) -> dict[str, float]:
+    """Run isolated node updates; no loss is formed over all private prompts."""
+    if not episodes:
+        raise ValueError("decentralized training requires at least one episode")
+    hidden_size = int(model.config.hidden_size)
+    dtype = model.get_input_embeddings().weight.dtype
+    nodes = {
+        node_id: DecentralizedLatentNode(
+            node_id, model, hidden_size, num_latents=num_latents,
+            device=device, dtype=dtype, learning_rate=learning_rate,
+            weight_decay=weight_decay,
+        )
+        for node_id in range(len(pilot_ids))
+    }
+    from ..hf_data import _pad
+    from .medical import build_agent_prompt_batch, load_hospital_private_stores
+    start_time = time.perf_counter()
+    losses: list[float] = []
+    for step in range(local_steps):
+        episode = episodes[step % len(episodes)]
+        source_row = build_agent_prompt_batch(
+            (episode,), load_hospital_private_stores(
+                hospital_dir, num_agents=1, hospital_ids=[pilot_ids[episode.source_id]],
+                hpo_embeddings_file=hpo_embeddings_file, hpo_ic_file=hpo_ic_file,
+            )[0], hospital_id=pilot_ids[episode.source_id], tokenizer=tokenizer,
+            max_prompt_length=max_prompt_length, max_target_length=max_target_length,
+        )[0]
+        source_ids, source_mask = _pad([source_row["host_question_ids"]], tokenizer.pad_token_id)
+        target_ids, target_mask = _pad([source_row["target_ids"]], tokenizer.pad_token_id)
+        target_labels = target_ids.masked_fill(target_mask == 0, IGNORE_INDEX)
+        incoming: KVBlock | None = None
+        for node_id, node in nodes.items():
+            local_row = build_agent_prompt_batch(
+                (episode,), load_hospital_private_stores(
+                    hospital_dir, num_agents=1, hospital_ids=[pilot_ids[node_id]],
+                    hpo_embeddings_file=hpo_embeddings_file, hpo_ic_file=hpo_ic_file,
+                )[0], hospital_id=pilot_ids[node_id], tokenizer=tokenizer,
+                max_prompt_length=max_prompt_length, max_target_length=max_target_length,
+            )[0]
+            local_ids, local_mask = _pad([local_row["local_ids"]], tokenizer.pad_token_id)
+            mode = "local" if incoming is None else "relay"
+            losses.append(node.train_step(
+                mode=mode, local_ids=local_ids.to(device), local_mask=local_mask.to(device),
+                source_ids=source_ids.to(device), source_mask=source_mask.to(device),
+                target_ids=target_ids.to(device), target_labels=target_labels.to(device),
+                incoming=() if incoming is None else (incoming,),
+            ))
+            with torch.no_grad():
+                incoming = node.protocol.rollout(local_ids.to(device), local_mask.to(device))
+    elapsed_seconds = time.perf_counter() - start_time
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "module_type": "DecentralizedLatentKV",
+        "model_name": model_name,
+        "num_latents": num_latents,
+        "route": {"num_agents": len(nodes), "R": 4, "k": 2,
+                   "pilot_hospital_ids": list(pilot_ids),
+                   "graph_edges": [list(edge) for edge in graph.edge_list()],
+                   "split_paths": dict(split_paths)},
+        "nodes": {node_id: {**node.state(), "optimizer": node.optimizer.state_dict()}
+                  for node_id, node in nodes.items()},
+        "training": {"mode": "decentralized", "local_steps": local_steps,
+                      "seed": seed, "updates": len(losses),
+                      "last_loss": losses[-1] if losses else float("nan"),
+                      "elapsed_seconds": elapsed_seconds},
+    }, output / "distributed_latent_decentralized.pt")
+    return {"updates": float(len(losses)), "last_loss": losses[-1] if losses else float("nan"),
+            "elapsed_seconds": elapsed_seconds, "peak_memory_bytes": 0.0}
+
+
 LatentKVProtocol = DistributedLatentProtocol
 
 __all__ = [
-    "KVBlock", "DistributedLatentProtocol", "LatentKVProtocol",
+    "KVBlock", "DistributedLatentProtocol", "DecentralizedLatentNode", "LatentKVProtocol",
     "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block", "kv_wire_bytes",
     "batched_rollout", "batched_relay_aggregate",
     "accumulation_steps_for",

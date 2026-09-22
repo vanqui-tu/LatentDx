@@ -3,7 +3,7 @@ from pathlib import Path
 
 from medlatent.distributed import (
     MedicalBaselineKind, MedicalEpisode, MedicalQuery, build_medical_agents,
-    TextGeneration, load_hospital_private_stores, path_graph, prediction_matches_target, run_medical_baseline,
+    TextGeneration, build_agent_retrieval_batch, load_hospital_private_stores, path_graph, prediction_matches_target, run_medical_baseline,
 )
 
 
@@ -74,3 +74,21 @@ def test_target_aliases_make_evaluation_language_and_format_insensitive():
 
     assert prediction_matches_target("NOONAN-SYNDROME", episode)
     assert not prediction_matches_target("Costello syndrome", episode)
+
+
+def test_agent_retrieval_batch_exposes_only_selected_store(tmp_path):
+    hospitals = tmp_path / "hospitals"
+    hospitals.mkdir()
+    _write(hospitals / "hospital_0.json", [_row("local", "HP:1", "Local")])
+    _write(hospitals / "hospital_1.json", [_row("private", "HP:2", "Private")])
+    embeddings, ic = tmp_path / "embeddings.json", tmp_path / "ic.json"
+    _write(embeddings, {"HP:1": [1.0, 0.0], "HP:2": [0.0, 1.0]})
+    _write(ic, {"HP:1": 1.0, "HP:2": 1.0})
+    stores = load_hospital_private_stores(
+        hospitals, num_agents=2, hpo_embeddings_file=embeddings, hpo_ic_file=ic,
+    )
+    episodes = (MedicalEpisode("train", MedicalQuery("query", ("HP:1",), "phenotype"), "Local", 0),)
+    batch = build_agent_retrieval_batch(episodes, stores, 0)
+    assert batch.agent_id == 0
+    assert batch.retrieved[0][0].label == "Local"
+    assert not hasattr(batch, "stores")

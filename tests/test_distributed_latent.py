@@ -2,7 +2,7 @@ import torch
 import pytest
 
 from medlatent.distributed.latent import (
-    DistributedLatentProtocol, accumulation_steps_for, batched_pilot_loss, load_distributed_latent_checkpoint, merge_kv_blocks,
+    DecentralizedLatentNode, DistributedLatentProtocol, accumulation_steps_for, batched_pilot_loss, load_distributed_latent_checkpoint, merge_kv_blocks,
     batched_relay_aggregate, batched_rollout, ring_two_hop_branches, save_distributed_latent_checkpoint,
     slice_kv_block, tiny_overfit,
 )
@@ -176,3 +176,32 @@ def test_fixed_route_and_checkpoint_metadata(tmp_path):
     assert payload["route"]["num_agents"] == 5
     assert payload["route"]["pilot_hospital_ids"] == [0, 1, 2, 3, 4]
     assert payload["training"]["tiny_overfit"]["local_final_loss"] == 1.0
+
+
+def test_decentralized_nodes_have_isolated_interfaces_and_detached_relay():
+    model = _Model()
+    nodes = [DecentralizedLatentNode(index, model, 4, num_latents=2, device="cpu") for index in range(5)]
+    assert all(not parameter.requires_grad for parameter in model.parameters())
+    assert all(left is not right for left, right in zip(nodes[0].parameters, nodes[1].parameters))
+    assert [tuple(parameter.shape for parameter in node.parameters) for node in nodes].count(
+        tuple(parameter.shape for parameter in nodes[0].parameters)
+    ) == len(nodes)
+
+    ids = torch.tensor([[1, 2]])
+    mask = torch.ones_like(ids)
+    source = torch.tensor([[3, 4]])
+    target = torch.tensor([[3, 4]])
+    leaf_block = nodes[0].protocol.rollout(ids, mask)
+    assert nodes[0].train_step(
+        mode="local", local_ids=ids, local_mask=mask, source_ids=source,
+        source_mask=mask, target_ids=target, target_labels=target,
+    ) >= 0
+    assert nodes[1].train_step(
+        mode="relay", local_ids=ids, local_mask=mask, source_ids=source,
+        source_mask=mask, target_ids=target, target_labels=target,
+        incoming=(leaf_block,),
+    ) >= 0
+    assert torch.autograd.grad(
+        nodes[1].protocol.rollout(ids, mask, (leaf_block,), detach_incoming=True)[0][0].sum(),
+        leaf_block[0][0], allow_unused=True,
+    ) == (None,)

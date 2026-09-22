@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Train the batched q4r6 distributed latent KV pilot (M3/L3.1+)."""
+"""Train the q4r6 distributed latent KV pilot (M3 or M4/L4.1)."""
 
 from __future__ import annotations
 
@@ -38,6 +38,10 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--local_files_only", action="store_true")
+    parser.add_argument("--training_mode", choices=("centralized", "decentralized"), default="centralized")
+    parser.add_argument("--decentralized", action="store_true",
+                        help="short alias for --training_mode decentralized")
+    parser.add_argument("--local_steps", type=int, default=1)
     args = parser.parse_args()
     query_file = args.query_file or args.train_file
     if query_file is None:
@@ -53,6 +57,8 @@ def main() -> None:
         epochs=args.epochs, max_steps=args.max_steps, learning_rate=args.learning_rate,
         weight_decay=args.weight_decay, seed=args.seed, device=args.device, dtype=args.dtype,
         local_files_only=args.local_files_only,
+        training_mode="decentralized" if args.decentralized else args.training_mode,
+        local_steps=args.local_steps,
     )
     print(f"distributed latent training complete: output_dir={args.output_dir} "
           f"updates={int(summary['updates'])} loss={summary['last_loss']:.4f} "

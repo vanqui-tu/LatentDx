@@ -1,6 +1,6 @@
 # Distributed Communication for Private-Knowledge Diagnosis
 
-> Working research and implementation plan. Last updated: 2026-09-16.
+> Working research and implementation plan. Last updated: 2026-09-22.
 >
 > Current scope: Phase 1 supports fixed, simple, undirected graphs only.
 > Directed graphs, dynamic topology, node churn, and network failures are
@@ -501,6 +501,11 @@ full-network jointly trained protocol. Query supervision comes from the
 stratified 40% query split and private evidence comes from the disjoint 60%
 retrieval pool:
 
+M3 is intentionally a centralized protocol-training oracle: one process owns
+the pilot batch and produces a shared checkpoint. Its purpose is to establish
+the best attainable latent interface before M4 removes this training
+assumption; M3 itself makes no decentralized-training claim.
+
 ```text
 query train:  data_original_skewed_10_q4r6/train.json
               (same cases as data_original/train_query40.json)
@@ -660,12 +665,36 @@ Exit only when batched training is reproducible, the relay re-encodes incoming
 blocks, and the frozen checkpoint has a matched utility/cost report. M3 does
 not claim decentralized training, learned routing, or topology optimization.
 
-### M4: learned protocol
+### M4: decentralized training of the latent protocol
 
-Learn aggregation, routing, and stopping one component at a time; add privacy
-attacks and scaling to `N >= 100`. Exit when the method improves a documented
-utility-cost-privacy frontier and the gain persists on tasks requiring
-complementary evidence.
+M3 is a centralized latent-training oracle: one process owns the pilot batch and
+produces a shared checkpoint. M4 removes that training assumption while keeping
+the inference protocol fixed. Every hospital owns a local copy of the small
+trainable latent interface; the Qwen backbone remains frozen. Each node computes
+losses using only its local query/retrieval examples and received latent blocks,
+then synchronizes distiller/boundary parameters with graph neighbors through
+peer-to-peer gossip. No parameter server, central gradient collector, learned
+routing, or learned stopping is introduced in M4.
+
+The two trainable computation modes remain the same as M3:
+
+```text
+local mode:  local prompt/retrieval -> local latent block -> local decision loss
+relay mode:  detached incoming block(s) + local prompt/retrieval
+             -> re-encoded latent block -> local decision loss
+```
+
+Relay child blocks are detached at the local training boundary. This avoids
+cross-node autograd while still training a common message semantics. Periodic
+gossip averaging and/or a neighbor consensus penalty keeps local copies in a
+shared latent space; independent local distillers are an explicit negative
+baseline, not the proposed protocol.
+
+M4 is complete only when decentralized training is compared with the M3
+centralized oracle and independent local training on the same q4r6 pilot. Report
+utility, latent drift/consensus, peer-update bytes, inference bytes, latency,
+and behavior under non-IID hospital shards. Routing, topology optimization,
+privacy attacks, and scaling beyond the pilot remain later work.
 
 ## 14. Open Decisions
 
@@ -714,8 +743,8 @@ select the earliest unblocked task. Use the following conventions:
 - At the end of a session, run the narrow relevant tests, record the command
   and result on the task line, and leave unrelated checkboxes unchanged.
 
-Current focus: `L3.1`. M2 is complete. The previous latent prototype was
-deleted; implement the new KV-based trainable protocol below.
+Current focus: `M4`. M3 centralized latent training and frozen evaluation are
+complete; M4 adds peer-to-peer training of local latent-interface copies.
 
 Completed planning tasks:
 
@@ -874,33 +903,66 @@ canonical result existed. Do not complete those tasks under their old scope.
   checkpoint reloads with model ID, `m`, pilot graph, route, split paths, and
   optimizer/training metadata. **DONE (2026-09-16; q4r6 pilot trained for one
   epoch at `batch_size=4`, approximately 40 minutes, with loadable checkpoint).**
-- [ ] **L3.3 - Frozen pilot and network-expansion evaluation.** IN PROGRESS
-  (2026-09-16; evaluator implemented, GPU evaluation pending). Freeze the L3.2
-  checkpoint and evaluate q4r6 `val.json`/`test.json` on the five-agent pilot,
-  then on the ten-hospital retrieval directory without retraining the latent
-  operator. Compare local-only, structured B2, text B2 where available, and
-  latent local/relay modes. **Files:** add
-  `scripts/evaluate_distributed_latent.py` for batched inference and JSONL/
-  summary output; extend `medlatent/distributed/latent.py` only for inference
-  batching and byte accounting; add focused evaluation assertions in
-  `tests/test_distributed_latent.py` and preserve existing M2 runner tests.
-  Record accuracy, source-local/remote evidence strata, mean messages and
-  latent bytes, `m`, latency, peak memory, route traces, checkpoint hash, and
-  pilot-versus-ten-hospital behavior. **Done when:** one reproducible result
-  table shows whether the frozen five-agent operator transfers to the ten-agent
-  network; no learned routing, new topology search, or full-network retraining
-  is added to M3.
+- [x] **L3.3 - Frozen pilot and network-expansion evaluation.** Evaluate the
+  frozen checkpoint on the five-agent pilot and ten-hospital expansion using
+  batched local/relay inference, JSONL traces, and summary metrics. The
+  expansion preserves the pilot induced subgraph and keeps source assignment
+  on pilot nodes. **DONE (2026-09-20; pilot and ten-hospital evaluation
+  artifacts saved; `DecentralizedMAS`: `python -m pytest -q` passed 33 tests).**
 
-### 15.5 Later work, not active tasks
+### 15.5 M4 - Decentralized latent-interface training
+
+- [x] **L4.1 - Local training replicas and privacy boundary.** Replace the
+  single shared M3 distiller with one local `LatentDistiller` and boundary copy
+  per pilot agent while keeping the Qwen backbone frozen. Reuse the q4r6 query
+  split and five-agent seeded shortcut graph; each node must construct local
+  prompts and compute local/relay losses without a process-level batch containing
+  all hospitals' private prompts. **Files:** `medlatent/distributed/latent.py`
+  adds a node-local training step and explicit `local`/`relay` mode;
+  `medlatent/distributed/medical.py` exposes per-agent query/retrieval batches;
+  `medlatent/distributed/agent.py` or a small existing helper stores local
+  trainable interface state without exposing another store;
+  `scripts/train_distributed_latent.py` gains a decentralized-training mode;
+  tests cover local-only data flow, detached incoming blocks, frozen backbone,
+  and identical parameter shapes across nodes. **Done when:** a five-node CPU
+  smoke runs one local and one relay update per node with no central loss over
+  all private stores. **DONE (2026-09-22; five-node CPU smoke and full suite
+  passed).**
+- [ ] **L4.2 - Peer-to-peer synchronization.** Implement periodic graph gossip
+  for only the trainable distiller/boundary state (or compact deltas), with no
+  parameter server and no central gradient aggregation. Start with deterministic
+  weighted neighbor averaging; optionally add a local consensus penalty, but do
+  not introduce learned routing or topology changes. **Files:** add the
+  synchronization helper in `medlatent/distributed/latent.py` or an existing
+  runtime module; extend checkpoint metadata with node states, gossip rounds,
+  mixing weights, local steps, and seeds; update the training CLI for local
+  steps and sync interval; add tests for symmetric mixing, reproducibility,
+  state-shape validation, and consensus-distance reduction. **Done when:** all
+  nodes can train and synchronize over the fixed graph, no central model is
+  required after initialization, and local losses remain finite.
+- [ ] **L4.3 - Decentralized evaluation and ablations.** Compare M4 with the
+  M3 centralized checkpoint/oracle and independent local distillers on the same
+  q4r6 pilot and held-out queries. Keep inference fixed: local encoding and
+  relay aggregation, `R=4`, `k=2`, no learned routing. **Files:** add or extend
+  `scripts/evaluate_distributed_latent.py` for per-node checkpoints and gossip
+  traces; extend latent summaries with utility, latent drift/consensus,
+  peer-update bytes, inference bytes, latency, peak memory, and non-IID shard
+  strata; add focused tests for checkpoint compatibility and deterministic
+  result aggregation. **Done when:** one table separates the cost of training
+  synchronization from inference communication and shows whether decentralized
+  training preserves M3 utility.
+
+### 15.6 Later work, not active tasks
 
 GNN aggregation, learned routing, learned stopping, additional graph families,
 larger `N`, heterogeneous backbones, formal privacy attacks, and robustness are
 deferred. Promote only one of them into an active task when the M3 result shows
 which limitation actually matters.
 
-The active sequence is `L3.1 -> L3.2 -> L3.3`.
+The completed sequence is `L3.1 -> L3.2 -> L3.3`; the active sequence is
+`L4.1 -> L4.2 -> L4.3`.
 
-### 15.6 Session log
+### 15.7 Session log
 
 Append one concise row after any session that changes code, experiment
 artifacts, task status, or settled research decisions. Commands should be
@@ -909,6 +971,8 @@ notes rather than expanding this table indefinitely.
 
 | Date | Session/work | Tasks | Verification/evidence | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-22 | Implement local latent replicas and privacy boundary | L4.1 | `DecentralizedMAS`: `python -m pytest -q` (35 passed) | Per-node distiller/boundary, explicit local/relay updates with detached incoming KV, agent-local retrieval/prompt batches, and decentralized CLI mode; backbone remains frozen |
+| 2026-09-22 | Promote decentralized latent training to M4 | M4 planning | Documentation-only; M3 retained as centralized oracle and M4 defined as local replicas plus graph gossip | Keep local/relay modes, frozen backbone, fixed sparse graph, and no learned routing |
 | 2026-09-05/06 | M0/M1 and medical/text substrate | FOUNDATION | M1 verification note; distributed suite and CPU smoke passed | Foundation frozen |
 | 2026-09-07 | Evidence-distance and remote-necessity fixes | M205, M206 | Commit `bd5d825`; 56 tests passed | Preserve the corrected concepts/tests where relevant; modules may be removed |
 | 2026-09-07 | Generalized experiment layer | retired M207-M209 | Uncommitted working tree | Reviewed as excessive for the current question |
@@ -929,4 +993,4 @@ notes rather than expanding this table indefinitely.
 | 2026-09-16 | Implement q4r6 pilot substrate and batched KV operator | L3.1 | `DecentralizedMAS`: `python -m pytest -q` (29 passed); q4r6 disjoint loader and seeded shortcut graph smoke | Pilot IDs and split/route metadata are saved in the latent checkpoint manifest |
 | 2026-09-16 | Implement L3.2 training path | L3.2 | `DecentralizedMAS`: `python -m pytest -q` (32 passed); fake local/relay overfit and checkpoint tests passed | Effective batch size is fixed at 8 queries; run Qwen q4r6 smoke then full pilot training on A100 |
 | 2026-09-16 | Add L3.2 training progress logs | L3.2 | `DecentralizedMAS`: `python -m pytest -q` (32 passed) | Report data setup, tiny-overfit loss, and periodic optimizer-update loss |
-| 2026-09-16 | Implement frozen latent evaluator | L3.3 | `DecentralizedMAS`: `python -m pytest -q` (32 passed); variable-length KV generation smoke passed | Evaluate pilot and ten-hospital expansion with JSONL traces and summary metrics |
+| 2026-09-20 | Complete frozen latent evaluation | L3.3 | Pilot/10-hospital artifacts saved; `DecentralizedMAS`: `python -m pytest -q` (33 passed) | Expansion preserves pilot edges; new nodes use seeded one-or-two-edge additions |

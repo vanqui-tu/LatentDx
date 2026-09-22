@@ -46,6 +46,44 @@ class MedicalRetrievedRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class MedicalAgentBatch:
+    """Public queries paired with one agent's derived retrieval results."""
+
+    agent_id: int
+    case_ids: tuple[str, ...]
+    queries: tuple[MedicalQuery, ...]
+    retrieved: tuple[tuple[MedicalRetrievedRecord, ...], ...]
+
+
+def build_agent_retrieval_batch(
+    episodes: Sequence[MedicalEpisode], stores: Mapping[int, HospitalPrivateStore],
+    agent_id: int, *, limit: int = 1,
+) -> MedicalAgentBatch:
+    """Build a batch from exactly one private store.
+
+    The returned object contains only public query fields and derived local
+    retrievals; callers never receive another agent's store or records.
+    """
+    if agent_id not in stores:
+        raise KeyError(f"unknown agent_id {agent_id}")
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+    selected = tuple(episodes)
+    store = stores[agent_id]
+    retrieved = tuple(store.retrieve(episode.query, limit=limit) for episode in selected)
+    return MedicalAgentBatch(
+        agent_id=int(agent_id),
+        case_ids=tuple(episode.query.case_id for episode in selected),
+        queries=tuple(episode.query for episode in selected),
+        retrieved=retrieved,
+    )
+
+
+# Clear alias for callers constructing node-local query/retrieval inputs.
+build_agent_query_batch = build_agent_retrieval_batch
+
+
+@dataclass(frozen=True, slots=True)
 class RetrievalAuditEvent:
     agent_id: int
     query_case_id: str
@@ -102,6 +140,46 @@ class HospitalPrivateStore(PrivateKnowledgeStore[MedicalRetrievedRecord]):
         selected = matches if limit is None else matches[:limit]
         self.__retrieval_events.append(RetrievalAuditEvent(self._agent_id, case_id, len(selected)))
         return selected
+
+
+def build_agent_prompt_batch(
+    episodes: Sequence[MedicalEpisode], store: HospitalPrivateStore, *, hospital_id: int,
+    tokenizer: Any, max_prompt_length: int = 320, max_target_length: int = 64,
+) -> tuple[dict[str, Any], ...]:
+    """Tokenize prompts from one private store without materializing other stores."""
+    from ..hf_data import _render_chat, _tokenize
+    from ..prompts import SYSTEM_PROMPT, build_hospital_prompt, build_host_question, build_target_answer
+
+    rows: list[dict[str, Any]] = []
+    for episode in episodes:
+        results = store.retrieve(episode.query, limit=1)
+        if not results:
+            raise ValueError(f"agent {store.agent_id} returned no retrieval for {episode.query.case_id}")
+        result = results[0]
+        hospital_prompt = build_hospital_prompt(
+            hospital_id=hospital_id, case_disease=result.label,
+            case_phenotype=result.phenotype_text, query_phenotype=episode.query.phenotype_text,
+        )
+        hospital_text = _render_chat(
+            tokenizer,
+            [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": hospital_prompt}],
+            add_generation_prompt=True,
+        )
+        host_text = _render_chat(
+            tokenizer, [{"role": "user", "content": build_host_question(episode.query.phenotype_text)}],
+            add_generation_prompt=True,
+        )
+        target = _tokenize(
+            tokenizer, build_target_answer(episode.target_label) + (tokenizer.eos_token or ""),
+            max_target_length,
+        )[:max_target_length]
+        rows.append({
+            "case_id": episode.query.case_id,
+            "local_ids": _tokenize(tokenizer, hospital_text, max_prompt_length),
+            "host_question_ids": _tokenize(tokenizer, host_text, max_prompt_length),
+            "target_ids": target,
+        })
+    return tuple(rows)
 
 
 @dataclass(frozen=True, slots=True)
