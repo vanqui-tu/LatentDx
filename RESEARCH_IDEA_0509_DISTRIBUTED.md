@@ -928,7 +928,7 @@ canonical result existed. Do not complete those tasks under their old scope.
   smoke runs one local and one relay update per node with no central loss over
   all private stores. **DONE (2026-09-22; five-node CPU smoke and full suite
   passed).**
-- [ ] **L4.2 - Peer-to-peer synchronization.** Implement periodic graph gossip
+- [x] **L4.2 - Peer-to-peer synchronization.** Implement periodic graph gossip
   for only the trainable distiller/boundary state (or compact deltas), with no
   parameter server and no central gradient aggregation. Start with deterministic
   weighted neighbor averaging; optionally add a local consensus penalty, but do
@@ -939,7 +939,8 @@ canonical result existed. Do not complete those tasks under their old scope.
   steps and sync interval; add tests for symmetric mixing, reproducibility,
   state-shape validation, and consensus-distance reduction. **Done when:** all
   nodes can train and synchronize over the fixed graph, no central model is
-  required after initialization, and local losses remain finite.
+  required after initialization, and local losses remain finite. **DONE
+  (2026-09-22; deterministic Metropolis gossip and CPU tests passed).**
 - [ ] **L4.3 - Decentralized evaluation and ablations.** Compare M4 with the
   M3 centralized checkpoint/oracle and independent local distillers on the same
   q4r6 pilot and held-out queries. Keep inference fixed: local encoding and
@@ -971,6 +972,7 @@ notes rather than expanding this table indefinitely.
 
 | Date | Session/work | Tasks | Verification/evidence | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-22 | Implement graph gossip synchronization | L4.2 | `DecentralizedMAS`: `python -m pytest -q` (38 passed) | Symmetric Metropolis mixing, atomic node-state updates, sync interval CLI, and checkpoint gossip metadata; no parameter server |
 | 2026-09-22 | Implement local latent replicas and privacy boundary | L4.1 | `DecentralizedMAS`: `python -m pytest -q` (35 passed) | Per-node distiller/boundary, explicit local/relay updates with detached incoming KV, agent-local retrieval/prompt batches, and decentralized CLI mode; backbone remains frozen |
 | 2026-09-22 | Promote decentralized latent training to M4 | M4 planning | Documentation-only; M3 retained as centralized oracle and M4 defined as local replicas plus graph gossip | Keep local/relay modes, frozen backbone, fixed sparse graph, and no learned routing |
 | 2026-09-05/06 | M0/M1 and medical/text substrate | FOUNDATION | M1 verification note; distributed suite and CPU smoke passed | Foundation frozen |

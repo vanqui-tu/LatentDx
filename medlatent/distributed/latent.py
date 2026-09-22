@@ -443,6 +443,91 @@ class DecentralizedLatentNode:
             "boundary": self.boundary.state(),
         }
 
+
+def metropolis_mixing_weights(graph: Any) -> dict[int, dict[int, float]]:
+    """Return deterministic symmetric, row-stochastic graph mixing weights."""
+    if not hasattr(graph, "agent_ids") or not hasattr(graph, "neighbors"):
+        raise TypeError("graph must provide agent_ids and neighbors")
+    degrees = {agent_id: len(graph.neighbors(agent_id)) for agent_id in graph.agent_ids}
+    weights: dict[int, dict[int, float]] = {}
+    for agent_id in graph.agent_ids:
+        row = {
+            neighbor: 1.0 / (1.0 + max(degrees[agent_id], degrees[neighbor]))
+            for neighbor in graph.neighbors(agent_id)
+        }
+        row[agent_id] = 1.0 - sum(row.values())
+        if row[agent_id] < -1e-12:
+            raise ValueError("graph mixing row has negative self weight")
+        row[agent_id] = max(0.0, row[agent_id])
+        weights[agent_id] = dict(sorted(row.items()))
+    return weights
+
+
+def _node_parameter_snapshots(nodes: Mapping[int, DecentralizedLatentNode], graph: Any) -> dict[int, dict[str, torch.Tensor]]:
+    expected = tuple(graph.agent_ids)
+    if tuple(sorted(nodes)) != expected:
+        raise ValueError("nodes must contain exactly the graph agent IDs")
+    snapshots: dict[int, dict[str, torch.Tensor]] = {}
+    reference_shapes: dict[str, tuple[int, ...]] | None = None
+    for agent_id in expected:
+        node = nodes[agent_id]
+        current = {name: parameter.detach().clone() for name, parameter in node.distiller.named_parameters()}
+        current.update({f"boundary.{name}": parameter.detach().clone()
+                        for name, parameter in node.boundary.named_parameters()})
+        shapes = {name: tuple(value.shape) for name, value in current.items()}
+        if reference_shapes is None:
+            reference_shapes = shapes
+        elif shapes != reference_shapes:
+            raise ValueError("all node interface parameters must have identical shapes")
+        snapshots[agent_id] = current
+    return snapshots
+
+
+def gossip_node_interfaces(
+    nodes: Mapping[int, DecentralizedLatentNode], graph: Any,
+    *, mixing_weights: Mapping[int, Mapping[int, float]] | None = None,
+) -> dict[int, dict[int, float]]:
+    """Synchronize node-local trainable interfaces with one atomic gossip step."""
+    snapshots = _node_parameter_snapshots(nodes, graph)
+    weights = metropolis_mixing_weights(graph) if mixing_weights is None else {
+        int(agent_id): {int(peer): float(weight) for peer, weight in row.items()}
+        for agent_id, row in mixing_weights.items()
+    }
+    expected = tuple(graph.agent_ids)
+    if tuple(sorted(weights)) != expected:
+        raise ValueError("mixing weights must contain exactly the graph agent IDs")
+    for agent_id in expected:
+        row = weights[agent_id]
+        if set(row) != set(graph.neighbors(agent_id)) | {agent_id}:
+            raise ValueError("mixing weights must match graph neighbors")
+        if any(weight < 0 for weight in row.values()) or abs(sum(row.values()) - 1.0) > 1e-6:
+            raise ValueError("each mixing row must be non-negative and sum to one")
+        for peer_id, weight in row.items():
+            if peer_id != agent_id and abs(weight - weights[peer_id].get(agent_id, -1.0)) > 1e-6:
+                raise ValueError("mixing weights must be symmetric")
+    for agent_id in expected:
+        node = nodes[agent_id]
+        with torch.no_grad():
+            for name, parameter in node.distiller.named_parameters():
+                value = sum(weights[agent_id][peer] * snapshots[peer][name]
+                            for peer in weights[agent_id])
+                parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+            for name, parameter in node.boundary.named_parameters():
+                key = f"boundary.{name}"
+                value = sum(weights[agent_id][peer] * snapshots[peer][key]
+                            for peer in weights[agent_id])
+                parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+    return {agent_id: dict(row) for agent_id, row in weights.items()}
+
+
+def interface_consensus_distance(nodes: Mapping[int, DecentralizedLatentNode], graph: Any) -> float:
+    """Return RMS distance of node interfaces from their parameter centroid."""
+    snapshots = _node_parameter_snapshots(nodes, graph)
+    vectors = [torch.cat([value.float().reshape(-1) for value in snapshots[agent_id].values()])
+               for agent_id in graph.agent_ids]
+    centroid = torch.stack(vectors).mean(dim=0)
+    return float(torch.stack([(vector - centroid).pow(2).mean() for vector in vectors]).mean().sqrt())
+
 # NOTE: Unused - Legacy
 # def two_hop_ring_blocks(protocol: DistributedLatentProtocol, *, leaf_ids: torch.Tensor,
 #                         leaf_mask: torch.Tensor, relay_ids: torch.Tensor,
@@ -584,11 +669,40 @@ def save_distributed_latent_checkpoint(path: str | Path, *, protocol: Distribute
     torch.save(payload, path)
 
 
+def save_decentralized_latent_checkpoint(
+    path: str | Path, *, nodes: Mapping[int, DecentralizedLatentNode], model_name: str,
+    route: Mapping[str, object], training: Mapping[str, object],
+    gossip: Mapping[str, object], optimizer: bool = True,
+) -> None:
+    """Save per-node trainable interfaces and decentralized training metadata."""
+    if not nodes:
+        raise ValueError("nodes must not be empty")
+    payload = {
+        "module_type": "DecentralizedLatentKV",
+        "model_name": model_name,
+        "num_latents": next(iter(nodes.values())).protocol.num_latents if nodes else 0,
+        "route": dict(route),
+        "nodes": {
+            int(node_id): {
+                **node.state(),
+                **({"optimizer": node.optimizer.state_dict()} if optimizer else {}),
+            }
+            for node_id, node in nodes.items()
+        },
+        "gossip": dict(gossip),
+        "training": dict(training),
+    }
+    torch.save(payload, path)
+
+
 def load_distributed_latent_checkpoint(path: str | Path, *, map_location: str | torch.device = "cpu") -> dict[str, Any]:
     payload = torch.load(path, map_location=map_location)
-    if payload.get("module_type") != "DistributedLatentKV":
-        raise ValueError(f"Expected DistributedLatentKV checkpoint, got {payload.get('module_type')!r}")
+    if payload.get("module_type") not in {"DistributedLatentKV", "DecentralizedLatentKV"}:
+        raise ValueError(f"Expected distributed latent checkpoint, got {payload.get('module_type')!r}")
     return payload
+
+
+load_decentralized_latent_checkpoint = load_distributed_latent_checkpoint
 
 
 def train_distributed_latent_real(*, model_name: str, train_file: str | Path | None = None,
@@ -605,8 +719,9 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
                                   weight_decay: float = 0.01, seed: int = 42,
                                   device: str = "cuda", dtype: str = "bfloat16",
                                   local_files_only: bool = False,
-                                  training_mode: str = "centralized", local_steps: int = 1) -> dict[str, float]:
-    """Train the shared operator on padded local/relay batches."""
+                                  training_mode: str = "centralized", local_steps: int = 1,
+                                  sync_interval: int = 1) -> dict[str, float]:
+    """Train the centralized M3 operator or decentralized local replicas."""
     query_file = query_file or train_file
     if query_file is None:
         raise ValueError("query_file is required")
@@ -614,6 +729,8 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
         raise ValueError("training_mode must be 'centralized' or 'decentralized'")
     if local_steps <= 0:
         raise ValueError("local_steps must be positive")
+    if sync_interval <= 0:
+        raise ValueError("sync_interval must be positive")
     if num_agents != 5:
         raise ValueError("the M3 pilot currently requires num_agents=5")
     if epochs <= 0 or max_steps < 0 or tiny_overfit_steps < 0:
@@ -661,6 +778,7 @@ def train_distributed_latent_real(*, model_name: str, train_file: str | Path | N
             hpo_embeddings_file=hpo_embeddings_file, hpo_ic_file=hpo_ic_file,
             num_latents=num_latents, learning_rate=learning_rate,
             weight_decay=weight_decay, local_steps=local_steps, seed=seed,
+            sync_interval=sync_interval,
             max_prompt_length=max_prompt_length, max_target_length=max_target_length,
             device=resolved_device,
         )
@@ -791,7 +909,7 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
                                hpo_embeddings_file: str | Path, hpo_ic_file: str | Path,
                                num_latents: int,
                                learning_rate: float, weight_decay: float, local_steps: int,
-                               seed: int, max_prompt_length: int, max_target_length: int,
+                               seed: int, sync_interval: int, max_prompt_length: int, max_target_length: int,
                                device: torch.device) -> dict[str, float]:
     """Run isolated node updates; no loss is formed over all private prompts."""
     if not episodes:
@@ -810,6 +928,8 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
     from .medical import build_agent_prompt_batch, load_hospital_private_stores
     start_time = time.perf_counter()
     losses: list[float] = []
+    gossip_rounds = 0
+    mixing_weights = metropolis_mixing_weights(graph)
     for step in range(local_steps):
         episode = episodes[step % len(episodes)]
         source_row = build_agent_prompt_batch(
@@ -841,26 +961,28 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
             ))
             with torch.no_grad():
                 incoming = node.protocol.rollout(local_ids.to(device), local_mask.to(device))
+        if (step + 1) % sync_interval == 0:
+            mixing_weights = gossip_node_interfaces(nodes, graph, mixing_weights=mixing_weights)
+            gossip_rounds += 1
     elapsed_seconds = time.perf_counter() - start_time
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "module_type": "DecentralizedLatentKV",
-        "model_name": model_name,
-        "num_latents": num_latents,
-        "route": {"num_agents": len(nodes), "R": 4, "k": 2,
-                   "pilot_hospital_ids": list(pilot_ids),
-                   "graph_edges": [list(edge) for edge in graph.edge_list()],
-                   "split_paths": dict(split_paths)},
-        "nodes": {node_id: {**node.state(), "optimizer": node.optimizer.state_dict()}
-                  for node_id, node in nodes.items()},
-        "training": {"mode": "decentralized", "local_steps": local_steps,
-                      "seed": seed, "updates": len(losses),
-                      "last_loss": losses[-1] if losses else float("nan"),
-                      "elapsed_seconds": elapsed_seconds},
-    }, output / "distributed_latent_decentralized.pt")
+    save_decentralized_latent_checkpoint(
+        output / "distributed_latent_decentralized.pt", nodes=nodes, model_name=model_name,
+        route={"num_agents": len(nodes), "R": 4, "k": 2,
+               "pilot_hospital_ids": list(pilot_ids),
+               "graph_edges": [list(edge) for edge in graph.edge_list()],
+               "split_paths": dict(split_paths)},
+        gossip={"rounds": gossip_rounds, "sync_interval": sync_interval,
+                "mixing_weights": {agent_id: dict(row) for agent_id, row in mixing_weights.items()}},
+        training={"mode": "decentralized", "local_steps": local_steps,
+                  "sync_interval": sync_interval, "seed": seed, "updates": len(losses),
+                  "last_loss": losses[-1] if losses else float("nan"),
+                  "elapsed_seconds": elapsed_seconds},
+    )
     return {"updates": float(len(losses)), "last_loss": losses[-1] if losses else float("nan"),
-            "elapsed_seconds": elapsed_seconds, "peak_memory_bytes": 0.0}
+            "elapsed_seconds": elapsed_seconds, "peak_memory_bytes": 0.0,
+            "gossip_rounds": float(gossip_rounds)}
 
 
 LatentKVProtocol = DistributedLatentProtocol
@@ -871,5 +993,7 @@ __all__ = [
     "batched_rollout", "batched_relay_aggregate",
     "accumulation_steps_for",
     "ring_two_hop_branches", "graph_two_hop_branches",
+    "metropolis_mixing_weights", "gossip_node_interfaces", "interface_consensus_distance",
     "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",
+    "save_decentralized_latent_checkpoint", "load_decentralized_latent_checkpoint",
 ]

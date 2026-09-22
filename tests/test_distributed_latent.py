@@ -2,11 +2,14 @@ import torch
 import pytest
 
 from medlatent.distributed.latent import (
-    DecentralizedLatentNode, DistributedLatentProtocol, accumulation_steps_for, batched_pilot_loss, load_distributed_latent_checkpoint, merge_kv_blocks,
+    DecentralizedLatentNode, DistributedLatentProtocol, accumulation_steps_for, batched_pilot_loss, gossip_node_interfaces,
+    interface_consensus_distance, load_decentralized_latent_checkpoint, load_distributed_latent_checkpoint,
+    merge_kv_blocks, metropolis_mixing_weights, save_decentralized_latent_checkpoint,
     batched_relay_aggregate, batched_rollout, ring_two_hop_branches, save_distributed_latent_checkpoint,
     slice_kv_block, tiny_overfit,
 )
 from medlatent.modules import BoundaryEmbeddings, LatentDistiller
+from medlatent.distributed.graph import path_graph, ring_graph
 
 
 class _Output:
@@ -205,3 +208,50 @@ def test_decentralized_nodes_have_isolated_interfaces_and_detached_relay():
         nodes[1].protocol.rollout(ids, mask, (leaf_block,), detach_incoming=True)[0][0].sum(),
         leaf_block[0][0], allow_unused=True,
     ) == (None,)
+
+
+def test_metropolis_gossip_is_symmetric_and_reduces_consensus_distance():
+    model = _Model()
+    graph = ring_graph(3)
+    nodes = {index: DecentralizedLatentNode(index, model, 4, num_latents=2) for index in range(3)}
+    with torch.no_grad():
+        for index, node in nodes.items():
+            node.distiller.latent_begin.fill_(float(index))
+            node.boundary.begin.fill_(float(index))
+    weights = metropolis_mixing_weights(graph)
+    assert all(abs(sum(row.values()) - 1.0) < 1e-6 for row in weights.values())
+    assert all(weights[left][right] == weights[right][left] for left, row in weights.items() for right in row if left != right)
+    before = interface_consensus_distance(nodes, graph)
+    returned = gossip_node_interfaces(nodes, graph)
+    after = interface_consensus_distance(nodes, graph)
+    assert returned == weights
+    assert after < before
+
+
+def test_gossip_rejects_mismatched_interface_shapes():
+    model = _Model()
+    nodes = {
+        0: DecentralizedLatentNode(0, model, 4, num_latents=2),
+        1: DecentralizedLatentNode(1, model, 5, num_latents=2),
+    }
+    with pytest.raises(ValueError, match="identical shapes"):
+        gossip_node_interfaces(nodes, path_graph(2))
+
+
+def test_decentralized_checkpoint_keeps_node_and_gossip_metadata(tmp_path):
+    model = _Model()
+    graph = path_graph(2)
+    nodes = {index: DecentralizedLatentNode(index, model, 4, num_latents=2) for index in range(2)}
+    weights = gossip_node_interfaces(nodes, graph)
+    path = tmp_path / "decentralized.pt"
+    save_decentralized_latent_checkpoint(
+        path, nodes=nodes, model_name="fake/model",
+        route={"graph_edges": [list(edge) for edge in graph.edge_list()]},
+        gossip={"rounds": 1, "mixing_weights": weights},
+        training={"seed": 42, "local_steps": 1},
+    )
+    payload = load_decentralized_latent_checkpoint(path)
+    assert payload["module_type"] == "DecentralizedLatentKV"
+    assert sorted(payload["nodes"]) == [0, 1]
+    assert payload["gossip"]["rounds"] == 1
+    assert payload["training"]["seed"] == 42

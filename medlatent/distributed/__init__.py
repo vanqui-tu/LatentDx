@@ -18,9 +18,10 @@ from .messages import MessageEnvelope, MessageKind, ProposalPayload, RequestPayl
 from .textmas import TextGeneration, TextGenerator, TransformersTextGenerator, VllmTextGenerator, build_agent_prompt, build_host_prompt, parse_textmas_answer
 from .latent import (
     DecentralizedLatentNode, DistributedLatentProtocol, KVBlock, LatentKVProtocol, accumulation_steps_for, batched_pilot_loss, batched_relay_aggregate, batched_rollout,
-    detach_kv_block, kv_wire_bytes, load_distributed_latent_checkpoint,
+    detach_kv_block, gossip_node_interfaces, interface_consensus_distance, kv_wire_bytes,
+    load_decentralized_latent_checkpoint, load_distributed_latent_checkpoint, metropolis_mixing_weights,
     graph_two_hop_branches, merge_kv_blocks, ring_two_hop_branches, save_distributed_latent_checkpoint,
-    select_kv_rows, slice_kv_block, tiny_overfit, train_distributed_latent_real
+    save_decentralized_latent_checkpoint, select_kv_rows, slice_kv_block, tiny_overfit, train_distributed_latent_real
 )
 
 __all__ = [
@@ -38,6 +39,8 @@ __all__ = [
     "DistributedLatentProtocol", "DecentralizedLatentNode", "LatentKVProtocol", "KVBlock", "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block",
     "batched_rollout", "batched_relay_aggregate", "batched_pilot_loss", "tiny_overfit", "accumulation_steps_for", "kv_wire_bytes",
     "ring_two_hop_branches", "graph_two_hop_branches",
+    "metropolis_mixing_weights", "gossip_node_interfaces", "interface_consensus_distance",
     "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",
+    "save_decentralized_latent_checkpoint", "load_decentralized_latent_checkpoint",
     "train_distributed_latent_real",
 ]
