@@ -43,8 +43,8 @@ def main() -> None:
                         help="short alias for --training_mode decentralized")
     parser.add_argument("--local_steps", type=int, default=0,
                         help="override episode steps; 0 means epochs * train episodes")
-    parser.add_argument("--sync_interval", type=int, default=32,
-                        help="decentralized local steps between graph gossip rounds")
+    parser.add_argument("--sync_interval", type=int, default=4,
+                        help="decentralized optimizer updates between graph gossip rounds")
     args = parser.parse_args()
     query_file = args.query_file or args.train_file
     if query_file is None:
