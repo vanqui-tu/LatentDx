@@ -207,7 +207,10 @@ def _evaluate_decentralized_method(*, method: str, protocols: dict[int, Distribu
             )
             started = time.perf_counter()
             routes = [graph_two_hop_branches(graph, batch[0].source_id)] * len(batch)
-            if method == "decentralized_local":
+            if method == "local_only":
+                branches = ()
+                messages = 0
+            elif method == "decentralized_local":
                 branches = []
                 messages = 2
                 for branch in (0, 1):
@@ -239,11 +242,14 @@ def _evaluate_decentralized_method(*, method: str, protocols: dict[int, Distribu
             )
             elapsed = time.perf_counter() - started
             total_seconds += elapsed
-            one_branch = select_kv_rows(branches[0], 0)
-            latent_bytes = messages * sum(
-                int(key.numel() * key.element_size() + value.numel() * value.element_size())
-                for key, value in one_branch
-            ) + 32 * messages
+            if branches:
+                one_branch = select_kv_rows(branches[0], 0)
+                latent_bytes = messages * sum(
+                    int(key.numel() * key.element_size() + value.numel() * value.element_size())
+                    for key, value in one_branch
+                ) + 32 * messages
+            else:
+                latent_bytes = 0
             for index, episode in enumerate(batch):
                 prediction = _prediction(tokenizer, generated[index])
                 useful = gold_agents.get(episode.query.case_id, set())
@@ -256,7 +262,8 @@ def _evaluate_decentralized_method(*, method: str, protocols: dict[int, Distribu
                     "target": episode.target_label,
                     "correct": prediction_matches_target(prediction, episode),
                     "evidence_stratum": stratum,
-                    "contacted_agent_ids": sorted({node for route in routes[index] for node in route}),
+                    "contacted_agent_ids": ([] if method == "local_only" else
+                                            sorted({node for route in routes[index] for node in route})),
                     "messages": messages,
                     "latent_bytes": latent_bytes,
                     "route": [list(route) for route in routes[index]],
@@ -307,7 +314,8 @@ def main() -> None:
     parser.add_argument("--hpo_ic_file", required=True, type=Path)
     parser.add_argument("--output_dir", required=True, type=Path)
     parser.add_argument("--model_name", default=None)
-    parser.add_argument("--hospital_ids", type=int, nargs="+", default=None)
+    parser.add_argument("--hospital_ids", "--pilot_hospital_ids", dest="hospital_ids", type=int,
+                        nargs="+", default=None)
     parser.add_argument("--num_agents", type=int, default=None)
     parser.add_argument("--methods", nargs="+", default=None,
                         choices=["local_only", "latent_local", "latent_relay",
@@ -392,7 +400,7 @@ def main() -> None:
     summaries: dict[str, dict[str, float]] = {}
     peak_memory = 0
     for method in methods:
-        if method.startswith("decentralized_"):
+        if decentralized:
             method_rows, elapsed, method_peak = _evaluate_decentralized_method(
                 method=method, protocols=protocols, tokenizer=tokenizer, episodes=episodes,
                 rows_by_case=rows_by_case, graph=graph, batch_size=args.batch_size,
