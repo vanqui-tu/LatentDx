@@ -661,6 +661,50 @@ def canonical_two_hop_losses(
     }
 
 
+def canonical_two_hop_losses_batch(
+    *, nodes: Mapping[int, DecentralizedLatentNode], trainers: Mapping[int, NodeLocalLatentTrainer],
+    graph: Any, episodes: Sequence[Any], lambda_leaf: float = 0.5,
+    lambda_relay: float = 0.5, lambda_src: float = 1.0,
+) -> dict[str, Any]:
+    """Vectorized canonical route for episodes sharing one source route."""
+    selected = tuple(episodes)
+    if not selected:
+        raise ValueError("episodes must not be empty")
+    source_id = selected[0].source_id
+    if any(episode.source_id != source_id for episode in selected):
+        raise ValueError("all episodes in a route batch must share source_id")
+    branches = graph_two_hop_branches(graph, source_id)
+    source_tensors = trainers[source_id].prepare_batch(selected)
+    leaf_blocks: list[KVBlock] = []
+    relay_blocks: list[KVBlock] = []
+    leaf_losses: list[torch.Tensor] = []
+    relay_losses: list[torch.Tensor] = []
+    for leaf_id, relay_id in branches:
+        leaf_loss, leaf_block = nodes[leaf_id].role_loss(
+            role="leaf", **trainers[leaf_id].prepare_batch(selected),
+        )
+        relay_loss, relay_block = nodes[relay_id].role_loss(
+            role="relay", incoming=(detach_kv_block(leaf_block),),
+            **trainers[relay_id].prepare_batch(selected),
+        )
+        leaf_losses.append(leaf_loss)
+        relay_losses.append(relay_loss)
+        leaf_blocks.append(detach_kv_block(leaf_block))
+        relay_blocks.append(detach_kv_block(relay_block))
+    source_loss, _ = nodes[source_id].role_loss(
+        role="source", incoming=tuple(relay_blocks), **source_tensors,
+    )
+    leaf_loss = torch.stack(leaf_losses).mean()
+    relay_loss = torch.stack(relay_losses).mean()
+    return {
+        "episode": selected[0], "episodes": selected,
+        "route": build_two_hop_route(graph, source_id),
+        "leaf_blocks": tuple(leaf_blocks), "relay_blocks": tuple(relay_blocks),
+        "leaf_loss": leaf_loss, "relay_loss": relay_loss, "source_loss": source_loss,
+        "total_loss": lambda_leaf * leaf_loss + lambda_relay * relay_loss + lambda_src * source_loss,
+    }
+
+
 def synchronous_decentralized_step(
     *, nodes: Mapping[int, DecentralizedLatentNode],
     trainers: Mapping[int, NodeLocalLatentTrainer], graph: Any, episode: Any,
@@ -698,27 +742,34 @@ def synchronous_decentralized_accumulation(
         node.optimizer.zero_grad(set_to_none=True)
     results: list[dict[str, Any]] = []
     for batch in micro_batches:
-        for episode in batch:
-            result = canonical_two_hop_losses(
-                nodes=nodes, trainers=trainers, graph=graph, episode=episode,
-            )
-            (result["total_loss"] / len(selected)).backward()
-            results.append(result)
+        result = canonical_two_hop_losses_batch(
+            nodes=nodes, trainers=trainers, graph=graph, episodes=batch,
+        )
+        (result["total_loss"] * (len(batch) / len(selected))).backward()
+        results.append({
+            "episode": result["episode"], "episodes": result["episodes"],
+            "leaf_loss": result["leaf_loss"].detach(),
+            "relay_loss": result["relay_loss"].detach(),
+            "source_loss": result["source_loss"].detach(),
+            "total_loss": result["total_loss"].detach(),
+        })
     after_forward = _node_parameter_snapshots(nodes, graph)
     for node_id in before:
         for name in before[node_id]:
             if not torch.equal(before[node_id][name], after_forward[node_id][name]):
                 raise RuntimeError("node parameters changed during synchronous batch forward")
-    total_loss = torch.stack([result["total_loss"] for result in results]).mean().detach()
+    total_loss = sum(
+        result["total_loss"].detach() * len(result["episodes"]) for result in results
+    ) / len(selected)
     for node in nodes.values():
         torch.nn.utils.clip_grad_norm_(node.parameters, 1.0)
     for node in nodes.values():
         node.optimizer.step()
     return {
         "total_loss": total_loss,
-        "leaf_loss": torch.stack([result["leaf_loss"] for result in results]).mean(),
-        "relay_loss": torch.stack([result["relay_loss"] for result in results]).mean(),
-        "source_loss": torch.stack([result["source_loss"] for result in results]).mean(),
+        "leaf_loss": sum(result["leaf_loss"].detach() * len(result["episodes"]) for result in results) / len(selected),
+        "relay_loss": sum(result["relay_loss"].detach() * len(result["episodes"]) for result in results) / len(selected),
+        "source_loss": sum(result["source_loss"].detach() * len(result["episodes"]) for result in results) / len(selected),
         "episodes": selected,
         "results": tuple(results),
     }
@@ -1223,9 +1274,19 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
     )
     total_episodes = local_steps if local_steps > 0 else len(episodes) * epochs
     scheduled = [episodes[index % len(episodes)] for index in range(total_episodes)]
-    random.Random(seed).shuffle(scheduled)
-    batches = [scheduled[start:start + batch_size]
-               for start in range(0, len(scheduled), batch_size)]
+    rng = random.Random(seed)
+    rng.shuffle(scheduled)
+    by_source: dict[int, list[Any]] = {}
+    for episode in scheduled:
+        by_source.setdefault(episode.source_id, []).append(episode)
+    source_order = list(by_source)
+    rng.shuffle(source_order)
+    batches: list[tuple[Any, ...]] = []
+    while any(by_source[source] for source in source_order):
+        for source in source_order:
+            if by_source[source]:
+                batches.append(tuple(by_source[source][:batch_size]))
+                del by_source[source][:batch_size]
     total_steps = math.ceil(len(scheduled) / effective_batch_size)
     hidden_size = int(model.config.hidden_size)
     dtype = model.get_input_embeddings().weight.dtype
@@ -1277,20 +1338,20 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
             micro_batches=batches[start:start + accumulation_steps],
         )
         for episode_result in result["results"]:
-            episode = episode_result["episode"]
             role_values = {
-                "leaf": float(episode_result["leaf_loss"].detach().cpu()),
-                "relay": float(episode_result["relay_loss"].detach().cpu()),
-                "source": float(episode_result["source_loss"].detach().cpu()),
+                "leaf": float(episode_result["leaf_loss"].cpu()),
+                "relay": float(episode_result["relay_loss"].cpu()),
+                "source": float(episode_result["source_loss"].cpu()),
             }
-            for leaf_id, relay_id in graph_two_hop_branches(graph, episode.source_id):
-                for node_id, role in ((leaf_id, "leaf"), (relay_id, "relay")):
-                    role_counts[node_id][role] += 1
-                    previous = role_loss_ema[node_id][role]
-                    role_loss_ema[node_id][role] = role_values[role] if previous is None else 0.9 * previous + 0.1 * role_values[role]
-            role_counts[episode.source_id]["source"] += 1
-            previous = role_loss_ema[episode.source_id]["source"]
-            role_loss_ema[episode.source_id]["source"] = role_values["source"] if previous is None else 0.9 * previous + 0.1 * role_values["source"]
+            for episode in episode_result["episodes"]:
+                for leaf_id, relay_id in graph_two_hop_branches(graph, episode.source_id):
+                    for node_id, role in ((leaf_id, "leaf"), (relay_id, "relay")):
+                        role_counts[node_id][role] += 1
+                        previous = role_loss_ema[node_id][role]
+                        role_loss_ema[node_id][role] = role_values[role] if previous is None else 0.9 * previous + 0.1 * role_values[role]
+                role_counts[episode.source_id]["source"] += 1
+                previous = role_loss_ema[episode.source_id]["source"]
+                role_loss_ema[episode.source_id]["source"] = role_values["source"] if previous is None else 0.9 * previous + 0.1 * role_values["source"]
         losses.append(float(result["total_loss"]))
         if step % sync_interval == 0:
             mixing_weights = gossip_node_interfaces(nodes, graph, mixing_weights=mixing_weights)
@@ -1336,7 +1397,7 @@ __all__ = [
     "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block", "kv_wire_bytes",
     "batched_rollout", "batched_relay_aggregate",
     "accumulation_steps_for",
-    "ring_two_hop_branches", "graph_two_hop_branches", "build_two_hop_route", "canonical_two_hop_losses", "synchronous_decentralized_step", "synchronous_decentralized_accumulation", "synchronous_decentralized_batch", "graph_broadcast_tree",
+    "ring_two_hop_branches", "graph_two_hop_branches", "build_two_hop_route", "canonical_two_hop_losses", "canonical_two_hop_losses_batch", "synchronous_decentralized_step", "synchronous_decentralized_accumulation", "synchronous_decentralized_batch", "graph_broadcast_tree",
     "metropolis_mixing_weights", "gossip_node_interfaces", "interface_consensus_distance",
     "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",
     "save_decentralized_latent_checkpoint", "load_decentralized_latent_checkpoint",
