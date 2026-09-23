@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -96,9 +97,14 @@ def ring_two_hop_branches(source_id: int, num_agents: int) -> tuple[tuple[int, i
 
 
 def graph_two_hop_branches(graph: Any, source_id: int, *, max_branches: int = 2) -> tuple[tuple[int, int], ...]:
-    """Select deterministic node-disjoint two-hop branches from a pilot graph."""
-    if max_branches <= 0:
-        raise ValueError("max_branches must be positive")
+    """Return exactly two deterministic ``(leaf, relay)`` branches.
+
+    M4 has one canonical route.  A graph that cannot provide two disjoint
+    branches is invalid for the episode instead of silently degrading to a
+    one-hop or single-branch route.
+    """
+    if max_branches != 2:
+        raise ValueError("M4 routes require exactly two branches")
     from itertools import combinations
 
     source_neighbors = set(graph.neighbors(source_id))
@@ -108,7 +114,7 @@ def graph_two_hop_branches(graph: Any, source_id: int, *, max_branches: int = 2)
         candidates.extend((leaf in source_neighbors, relay, leaf) for leaf in leaves)
 
     ordered = sorted(candidates)
-    for branch_count in range(min(max_branches, len(source_neighbors)), 0, -1):
+    for branch_count in (2,):
         valid = []
         for choice in combinations(ordered, branch_count):
             relays = {relay for _, relay, _ in choice}
@@ -120,7 +126,28 @@ def graph_two_hop_branches(graph: Any, source_id: int, *, max_branches: int = 2)
         if valid:
             _, routes = min(valid)
             return tuple((leaf, relay) for relay, leaf in routes)
-    return ()
+    raise ValueError(f"source {source_id} has no two node-disjoint two-hop branches")
+
+
+def build_two_hop_route(
+    graph: Any, source_id: int, *, block_shape: tuple[int, ...] | None = None,
+    wire_bytes: int | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Build the shared causal route record used by training and evaluation."""
+    branches = graph_two_hop_branches(graph, source_id)
+    route = []
+    for branch, (leaf, relay) in enumerate(branches):
+        if not graph.has_edge(source_id, relay) or not graph.has_edge(relay, leaf):
+            raise ValueError("two-hop route contains a non-edge")
+        if leaf == source_id or leaf == relay or relay == source_id:
+            raise ValueError("two-hop route contains an invalid role assignment")
+        route.extend((
+            {"branch": branch, "sender": leaf, "receiver": relay, "round": 2, "kind": "PROPOSAL",
+             "block_shape": block_shape, "wire_bytes": wire_bytes},
+            {"branch": branch, "sender": relay, "receiver": source_id, "round": 3, "kind": "PROPOSAL",
+             "block_shape": block_shape, "wire_bytes": wire_bytes},
+        ))
+    return tuple(route)
 
 
 class DistributedLatentProtocol:
@@ -421,6 +448,40 @@ class DecentralizedLatentNode:
             source_ids, source_mask, target_ids, target_labels, (block,)
         )
 
+    def role_loss(self, *, role: str, local_ids: torch.Tensor, local_mask: torch.Tensor,
+                  public_ids: torch.Tensor, public_mask: torch.Tensor,
+                  source_ids: torch.Tensor, source_mask: torch.Tensor,
+                  target_ids: torch.Tensor, target_labels: torch.Tensor,
+                  incoming: Sequence[KVBlock] = ()) -> tuple[torch.Tensor, KVBlock | tuple[()]]:
+        """Compute one explicit M4 role loss and return its fresh block.
+
+        Leaf and relay supervision uses only the public query.  The source
+        supervision uses its private prompt and only returned relay blocks.
+        Incoming blocks are transport payloads and are detached at every
+        boundary.
+        """
+        if role == "leaf":
+            if incoming:
+                raise ValueError("leaf role cannot receive incoming blocks")
+            block = self.protocol.rollout(local_ids, local_mask)
+            loss = self.protocol.source_loss(public_ids, public_mask, target_ids, target_labels, (block,))
+        elif role == "relay":
+            if len(incoming) != 1:
+                raise ValueError("relay role requires one leaf block")
+            block = self.protocol.relay_rollout(local_ids, local_mask, incoming, detach_children=True)
+            loss = self.protocol.source_loss(public_ids, public_mask, target_ids, target_labels, (block,))
+        elif role == "source":
+            if len(incoming) != 2:
+                raise ValueError("source role requires two relay blocks")
+            # The source replica also participates in the interface: it
+            # consumes the two returned relay blocks with its private prompt,
+            # then predicts from that source-local representation.
+            block = self.protocol.rollout(local_ids, local_mask, incoming, detach_incoming=True)
+            loss = self.protocol.source_loss(source_ids, source_mask, target_ids, target_labels, (block,))
+        else:
+            raise ValueError("role must be 'leaf', 'relay', or 'source'")
+        return loss, block
+
     def train_step(self, *, mode: str, local_ids: torch.Tensor,
                    local_mask: torch.Tensor, source_ids: torch.Tensor,
                    source_mask: torch.Tensor, target_ids: torch.Tensor,
@@ -438,6 +499,18 @@ class DecentralizedLatentNode:
         torch.nn.utils.clip_grad_norm_(self.parameters, 1.0)
         self.optimizer.step()
         return float(loss.detach().cpu())
+
+    def train_role_step(self, *, role: str, incoming: Sequence[KVBlock] = (),
+                        **tensors: torch.Tensor) -> tuple[float, KVBlock | tuple[()]]:
+        """Apply one optimizer step for one M4 role."""
+        self.distiller.train()
+        self.boundary.train()
+        self.optimizer.zero_grad(set_to_none=True)
+        loss, block = self.role_loss(role=role, incoming=incoming, **tensors)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters, 1.0)
+        self.optimizer.step()
+        return float(loss.detach().cpu()), block
 
     def state(self) -> dict[str, Any]:
         return {
@@ -486,9 +559,8 @@ class NodeLocalLatentTrainer:
                       incoming: Sequence[KVBlock] = ()) -> tuple[float, KVBlock]:
         return self.train_batch((episode,), mode=mode, incoming=incoming)
 
-    def train_batch(self, episodes: Sequence[Any], *, mode: str,
-                    incoming: Sequence[KVBlock] = ()) -> tuple[float, KVBlock]:
-        """Train one node on a batch of same-route episodes."""
+    def prepare_batch(self, episodes: Sequence[Any]) -> dict[str, torch.Tensor]:
+        """Materialize only this node's private prompt and public query."""
         from ..hf_data import _pad
         from .medical import build_agent_prompt_batch
 
@@ -500,23 +572,34 @@ class NodeLocalLatentTrainer:
             max_prompt_length=self.max_prompt_length, max_target_length=self.max_target_length,
         )
         local_rows = [row["local_ids"] for row in rows]
+        public_rows = [row["public_query_ids"] for row in rows]
         source_rows = [row["local_ids"] + row["host_question_ids"] for row in rows]
         local_ids, local_mask = _pad(local_rows, self.tokenizer.pad_token_id)
+        public_ids, public_mask = _pad(public_rows, self.tokenizer.pad_token_id)
         source_ids, source_mask = _pad(source_rows, self.tokenizer.pad_token_id)
         target_ids, target_mask = _pad([row["target_ids"] for row in rows], self.tokenizer.pad_token_id)
-        target_labels = target_ids.masked_fill(target_mask == 0, IGNORE_INDEX)
-        local_ids = local_ids.to(self.device)
-        local_mask = local_mask.to(self.device)
-        source_ids = source_ids.to(self.device)
-        source_mask = source_mask.to(self.device)
-        target_ids = target_ids.to(self.device)
-        target_labels = target_labels.to(self.device)
+        tensors = {
+            "local_ids": local_ids, "local_mask": local_mask,
+            "public_ids": public_ids, "public_mask": public_mask,
+            "source_ids": source_ids, "source_mask": source_mask,
+            "target_ids": target_ids,
+            "target_labels": target_ids.masked_fill(target_mask == 0, IGNORE_INDEX),
+        }
+        return {key: value.to(self.device) for key, value in tensors.items()}
+
+    def train_batch(self, episodes: Sequence[Any], *, mode: str,
+                    incoming: Sequence[KVBlock] = ()) -> tuple[float, KVBlock]:
+        """Train one node on a batch of same-route episodes."""
+        episodes = tuple(episodes)
+        tensors = self.prepare_batch(episodes)
         loss = self.node.train_step(
-            mode=mode, local_ids=local_ids, local_mask=local_mask,
-            source_ids=source_ids, source_mask=source_mask,
-            target_ids=target_ids, target_labels=target_labels, incoming=incoming,
+            mode=mode, incoming=incoming,
+            local_ids=tensors["local_ids"], local_mask=tensors["local_mask"],
+            source_ids=tensors["source_ids"], source_mask=tensors["source_mask"],
+            target_ids=tensors["target_ids"], target_labels=tensors["target_labels"],
         )
         with torch.no_grad():
+            local_ids, local_mask = tensors["local_ids"], tensors["local_mask"]
             if mode == "local":
                 outgoing = self.node.protocol.rollout(local_ids, local_mask)
             else:
@@ -524,6 +607,57 @@ class NodeLocalLatentTrainer:
                     local_ids, local_mask, incoming, detach_children=True,
                 )
         return loss, outgoing
+
+
+def canonical_two_hop_losses(
+    *, nodes: Mapping[int, DecentralizedLatentNode], trainers: Mapping[int, NodeLocalLatentTrainer],
+    graph: Any, episode: Any, lambda_leaf: float = 0.5, lambda_relay: float = 0.5,
+    lambda_src: float = 1.0,
+) -> dict[str, Any]:
+    """Build one canonical M4 computation graph for a single episode.
+
+    Every prompt is materialized by its owning trainer.  Returned blocks are
+    detached before crossing an edge, and the source receives relay blocks
+    only.  Callers can backpropagate ``total_loss`` or inspect the role losses.
+    """
+    if set(nodes) != set(graph.agent_ids) or set(trainers) != set(graph.agent_ids):
+        raise ValueError("nodes and trainers must contain exactly the graph agents")
+    for value, name in ((lambda_leaf, "lambda_leaf"), (lambda_relay, "lambda_relay"), (lambda_src, "lambda_src")):
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+    branches = graph_two_hop_branches(graph, episode.source_id)
+    source_tensors = trainers[episode.source_id].prepare_batch((episode,))
+    leaf_blocks: list[KVBlock] = []
+    relay_blocks: list[KVBlock] = []
+    leaf_losses: list[torch.Tensor] = []
+    relay_losses: list[torch.Tensor] = []
+    for leaf_id, relay_id in branches:
+        leaf_tensors = trainers[leaf_id].prepare_batch((episode,))
+        relay_tensors = trainers[relay_id].prepare_batch((episode,))
+        leaf_loss, leaf_block = nodes[leaf_id].role_loss(role="leaf", **leaf_tensors)
+        relay_loss, relay_block = nodes[relay_id].role_loss(
+            role="relay", incoming=(detach_kv_block(leaf_block),), **relay_tensors,
+        )
+        leaf_losses.append(leaf_loss)
+        relay_losses.append(relay_loss)
+        leaf_blocks.append(detach_kv_block(leaf_block))
+        relay_blocks.append(detach_kv_block(relay_block))
+    source_loss, _ = nodes[episode.source_id].role_loss(
+        role="source", incoming=tuple(relay_blocks), **source_tensors,
+    )
+    leaf_loss = torch.stack(leaf_losses).mean()
+    relay_loss = torch.stack(relay_losses).mean()
+    total = lambda_leaf * leaf_loss + lambda_relay * relay_loss + lambda_src * source_loss
+    shape = tuple(int(value) for value in relay_blocks[0][0][0].shape) if relay_blocks else None
+    return {
+        "route": build_two_hop_route(
+            graph, episode.source_id, block_shape=shape,
+            wire_bytes=kv_wire_bytes(relay_blocks[0]) if relay_blocks else 0,
+        ),
+        "leaf_blocks": tuple(leaf_blocks), "relay_blocks": tuple(relay_blocks),
+        "leaf_loss": leaf_loss, "relay_loss": relay_loss, "source_loss": source_loss,
+        "total_loss": total,
+    }
 
 
 def metropolis_mixing_weights(graph: Any) -> dict[int, dict[int, float]]:
@@ -702,7 +836,9 @@ def _pilot_batch_tensors(*, episodes: Sequence[Any], rows_by_case: Mapping[str, 
     """Assemble one padded source/leaf/relay batch in stable branch order."""
     from ..hf_data import _pad
 
-    routes = [graph_two_hop_branches(graph, episode.source_id) for episode in episodes]
+    routes = [tuple((event["sender"], event["receiver"])
+                    for event in build_two_hop_route(graph, episode.source_id)
+                    if event["round"] == 2) for episode in episodes]
     if any(len(route) != 2 for route in routes):
         raise ValueError("pilot graph must provide two two-hop branches per source")
     leaf_rows = [rows_by_case[e.query.case_id]["hospital_ids_all"][leaf]
@@ -995,19 +1131,16 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
                                epochs: int, batch_size: int, seed: int, sync_interval: int,
                                max_prompt_length: int, max_target_length: int,
                                device: torch.device) -> dict[str, float]:
-    """Run isolated node updates; no loss is formed over all private prompts."""
+    """Train node-local replicas on the canonical two-hop route."""
     if not episodes:
         raise ValueError("decentralized training requires at least one episode")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     total_episodes = local_steps if local_steps > 0 else len(episodes) * epochs
     scheduled = [episodes[index % len(episodes)] for index in range(total_episodes)]
-    grouped: dict[int, list[Any]] = {}
-    for episode in scheduled:
-        grouped.setdefault(episode.source_id, []).append(episode)
-    batches = [grouped[source][start:start + batch_size]
-               for source in sorted(grouped)
-               for start in range(0, len(grouped[source]), batch_size)]
+    random.Random(seed).shuffle(scheduled)
+    batches = [scheduled[start:start + batch_size]
+               for start in range(0, len(scheduled), batch_size)]
     total_steps = len(batches)
     hidden_size = int(model.config.hidden_size)
     dtype = model.get_input_embeddings().weight.dtype
@@ -1049,23 +1182,20 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
         flush=True,
     )
     for step, batch in enumerate(batches):
-        episode = batch[0]
-        order, parent = graph_broadcast_tree(graph, episode.source_id, max_fanout=2)
-        outgoing: dict[int, KVBlock] = {}
         step_losses: list[float] = []
-        for node_id in order:
-            if node_id == episode.source_id:
-                mode = "local"
-                incoming = ()
-            else:
-                mode = "relay"
-                incoming = (outgoing[parent[node_id]],)
-            loss, block = trainers[node_id].train_batch(
-                batch, mode=mode, incoming=incoming,
+        for episode in batch:
+            for node in nodes.values():
+                node.optimizer.zero_grad(set_to_none=True)
+            result = canonical_two_hop_losses(
+                nodes=nodes, trainers=trainers, graph=graph, episode=episode,
             )
-            losses.append(loss)
-            step_losses.append(loss)
-            outgoing[node_id] = block
+            result["total_loss"].backward()
+            for node in nodes.values():
+                torch.nn.utils.clip_grad_norm_(node.parameters, 1.0)
+                node.optimizer.step()
+            value = float(result["total_loss"].detach().cpu())
+            losses.append(value)
+            step_losses.append(value)
         if (step + 1) % sync_interval == 0:
             mixing_weights = gossip_node_interfaces(nodes, graph, mixing_weights=mixing_weights)
             gossip_rounds += 1
@@ -1091,6 +1221,7 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
         training={"mode": "decentralized", "epochs": epochs, "batch_size": batch_size,
                   "local_steps": local_steps, "total_steps": total_steps,
                   "sync_interval": sync_interval, "seed": seed, "updates": len(losses),
+                  "role_loss_weights": {"leaf": 0.5, "relay": 0.5, "source": 1.0},
                   "last_loss": losses[-1] if losses else float("nan"),
                   "elapsed_seconds": elapsed_seconds},
     )
@@ -1106,7 +1237,7 @@ __all__ = [
     "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block", "kv_wire_bytes",
     "batched_rollout", "batched_relay_aggregate",
     "accumulation_steps_for",
-    "ring_two_hop_branches", "graph_two_hop_branches", "graph_broadcast_tree",
+    "ring_two_hop_branches", "graph_two_hop_branches", "build_two_hop_route", "canonical_two_hop_losses", "graph_broadcast_tree",
     "metropolis_mixing_weights", "gossip_node_interfaces", "interface_consensus_distance",
     "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",
     "save_decentralized_latent_checkpoint", "load_decentralized_latent_checkpoint",

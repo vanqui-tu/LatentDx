@@ -2,11 +2,11 @@ import torch
 import pytest
 
 from medlatent.distributed.latent import (
-    DecentralizedLatentNode, DistributedLatentProtocol, accumulation_steps_for, batched_pilot_loss, gossip_node_interfaces,
+    DecentralizedLatentNode, DistributedLatentProtocol, accumulation_steps_for, batched_pilot_loss, build_two_hop_route, canonical_two_hop_losses, gossip_node_interfaces,
     graph_broadcast_tree, interface_consensus_distance, load_decentralized_latent_checkpoint, load_distributed_latent_checkpoint,
     merge_kv_blocks, metropolis_mixing_weights, save_decentralized_latent_checkpoint,
     batched_relay_aggregate, batched_rollout, ring_two_hop_branches, save_distributed_latent_checkpoint,
-    slice_kv_block, tiny_overfit,
+    slice_kv_block, tiny_overfit, graph_two_hop_branches,
 )
 from medlatent.modules import BoundaryEmbeddings, LatentDistiller
 from medlatent.distributed.graph import path_graph, ring_graph
@@ -294,3 +294,50 @@ def test_node_local_trainer_batches_local_and_relay_queries():
     assert loss >= 0
     assert relay[0][0].shape[0] == 2
     assert not relay[0][0].requires_grad
+
+
+def test_m4_route_requires_two_disjoint_branches_and_records_only_graph_edges():
+    graph = ring_graph(5)
+    route = build_two_hop_route(graph, 0)
+    assert len(route) == 4
+    assert all(graph.has_edge(event["sender"], event["receiver"]) for event in route)
+    assert all(not (event["sender"] != 0 and event["receiver"] == 0 and event["round"] == 2) for event in route)
+    with pytest.raises(ValueError, match="two node-disjoint"):
+        graph_two_hop_branches(path_graph(4), 0)
+
+
+def test_m4_canonical_loss_uses_leaf_relay_source_roles():
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token = ""
+
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+            return " ".join(message["content"] for message in messages)
+
+        def __call__(self, text, *, add_special_tokens, truncation, max_length):
+            return {"input_ids": [((ord(char) % 7) + 1) for char in text[:max_length]] or [1]}
+
+    class Store:
+        def __init__(self, agent_id):
+            self.agent_id = agent_id
+
+        def retrieve(self, query, *, limit):
+            return (MedicalRetrievedRecord(f"record-{self.agent_id}", "Disease", "phenotype", 1.0),)
+
+    from medlatent.distributed.latent import NodeLocalLatentTrainer
+    from medlatent.distributed.graph import ring_graph
+
+    episode = MedicalEpisode("train", MedicalQuery("q", ("HP:1",), "phenotype"), "Disease", 0)
+    model = _Model()
+    graph = ring_graph(5)
+    nodes = {index: DecentralizedLatentNode(index, model, 4, num_latents=2) for index in graph.agent_ids}
+    trainers = {
+        index: NodeLocalLatentTrainer(nodes[index], Store(index), tokenizer=Tokenizer(), hospital_id=index)
+        for index in graph.agent_ids
+    }
+    result = canonical_two_hop_losses(nodes=nodes, trainers=trainers, graph=graph, episode=episode)
+    assert len(result["leaf_blocks"]) == len(result["relay_blocks"]) == 2
+    assert all(not block[0][0].requires_grad for block in result["relay_blocks"])
+    assert result["leaf_loss"].ndim == result["relay_loss"].ndim == result["source_loss"].ndim == 0
+    result["total_loss"].backward()
+    assert any(parameter.grad is not None for parameter in nodes[0].parameters)

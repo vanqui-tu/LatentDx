@@ -177,6 +177,7 @@ def build_agent_prompt_batch(
             "case_id": episode.query.case_id,
             "local_ids": _tokenize(tokenizer, hospital_text, max_prompt_length),
             "host_question_ids": _tokenize(tokenizer, host_text, max_prompt_length),
+            "public_query_ids": _tokenize(tokenizer, host_text, max_prompt_length),
             "target_ids": target,
         })
     return tuple(rows)

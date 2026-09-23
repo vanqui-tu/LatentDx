@@ -20,7 +20,7 @@ from medlatent.distributed import (  # noqa: E402
     DistributedLatentProtocol,
     CommunicationGraph,
     extend_graph,
-    graph_two_hop_branches,
+    build_two_hop_route,
     load_hospital_private_stores,
     load_distributed_latent_checkpoint,
     load_medical_split,
@@ -130,7 +130,9 @@ def _evaluate_method(*, method: str, protocol: DistributedLatentProtocol, tokeni
                 routes = [() for _ in batch]
                 messages, latent_bytes = 0, 0
             else:
-                routes = [graph_two_hop_branches(graph, episode.source_id) for episode in batch]
+                routes = [tuple((event["sender"], event["receiver"])
+                                for event in build_two_hop_route(graph, episode.source_id)
+                                if event["round"] == 2) for episode in batch]
                 leaf_blocks = protocol.rollout(tensors["leaf_ids"], tensors["leaf_mask"])
                 if method == "latent_relay":
                     final_blocks = protocol.relay_rollout(
@@ -206,7 +208,10 @@ def _evaluate_decentralized_method(*, method: str, protocols: dict[int, Distribu
                 pad_token_id=pad_token_id, device=device,
             )
             started = time.perf_counter()
-            routes = [graph_two_hop_branches(graph, batch[0].source_id)] * len(batch)
+            route = tuple((event["sender"], event["receiver"])
+                          for event in build_two_hop_route(graph, batch[0].source_id)
+                          if event["round"] == 2)
+            routes = [route] * len(batch)
             if method == "local_only":
                 branches = ()
                 messages = 0

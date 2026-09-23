@@ -630,6 +630,14 @@ privacy adversaries, or a generalized latent registry in M3.
   request-return routing;
 - the five-node ring produces B0/B1/B2 predictions and costs; and
 - a fake text generator exercises the same route without loading a model.
+- an M4 episode emits only `s -> relay -> leaf` requests and
+  `leaf -> relay -> s` latent returns, with no leaf-to-source send;
+- M4 training and evaluation produce identical `(leaf, relay)` branch routes,
+  and the source consumes relay blocks only;
+- a synchronous M4 step never consumes a block generated after that step's
+  optimizer update; and
+- role-balanced fixtures produce finite, separately logged `L_leaf`, `L_relay`,
+  and `L_src` values for every node.
 
 Keep the three-node complementary-evidence fixture inline in a runtime or
 medical test rather than maintaining a separate synthetic application. Real
@@ -667,34 +675,157 @@ not claim decentralized training, learned routing, or topology optimization.
 
 ### M4: decentralized training of the latent protocol
 
-M3 is a centralized latent-training oracle: one process owns the pilot batch and
-produces a shared checkpoint. M4 removes that training assumption while keeping
-the inference protocol fixed. Every hospital owns a local copy of the small
-trainable latent interface; the Qwen backbone remains frozen. Each node computes
-losses using only its local query/retrieval examples and received latent blocks,
-then synchronizes distiller/boundary parameters with graph neighbors through
-peer-to-peer gossip. No parameter server, central gradient collector, learned
-routing, or learned stopping is introduced in M4.
+M3 is a centralized latent-training oracle. M4 trains one interface replica per
+agent, but the **training computation graph must be the same graph used at
+inference**. The Qwen backbone is frozen. There is no parameter server, central
+gradient aggregation, learned routing, or learned stopping.
 
-The two trainable computation modes remain the same as M3:
+#### 13.1 Canonical two-hop episode
+
+Every M4 episode has one source `s` and exactly two node-disjoint branches:
 
 ```text
-local mode:  local prompt/retrieval -> local latent block -> local decision loss
-relay mode:  detached incoming block(s) + local prompt/retrieval
-             -> re-encoded latent block -> local decision loss
+source s <- relay r_0 <- leaf l_0
+          <- relay r_1 <- leaf l_1
 ```
 
-Relay child blocks are detached at the local training boundary. This avoids
-cross-node autograd while still training a common message semantics. Periodic
-gossip averaging and/or a neighbor consensus penalty keeps local copies in a
-shared latent space; independent local distillers are an explicit negative
-baseline, not the proposed protocol.
+For each branch, require `A[s,r_b] = 1`, `A[r_b,l_b] = 1`,
+`l_b != s`, `l_0 != l_1`, and `r_0 != r_1`; a leaf must not send directly to
+the source. The route builder returns `(leaf, relay)` tuples and is the single
+source of truth for training, evaluation, and trace validation. If the graph
+cannot provide two valid branches, the episode is rejected rather than silently
+using a one-hop or non-graph route.
 
-M4 is complete only when decentralized training is compared with the M3
-centralized oracle and independent local training on the same q4r6 pilot. Report
-utility, latent drift/consensus, peer-update bytes, inference bytes, latency,
-and behavior under non-IID hospital shards. Routing, topology optimization,
-privacy attacks, and scaling beyond the pilot remain later work.
+The data direction is evidence toward the source. When request messages are
+materialized, the logical schedule is fixed as follows (`R=4`, `k=2`):
+
+```text
+round 0: source s sends REQUEST to r_0 and r_1
+round 1: each relay sends REQUEST to its leaf l_b
+round 2: each leaf sends latent B_leaf_b to its relay r_b
+round 3: each relay sends latent B_relay_b to source s
+after round 3: source predicts from both relay blocks
+```
+
+Implementations that precompute public query prompts may omit the request
+payload at runtime, but must preserve this causal order in the route trace and
+must not compute a source prediction before both return hops. A distance-two
+leaf can affect the source only after the relay has re-encoded it. A leaf block
+is never forwarded directly to `s`, and a source-produced block is never used
+as a child block for this return path.
+
+#### 13.2 Forward computation and message contract
+
+Let `theta_i` be node `i`'s distiller and boundary parameters, and let `x_i`
+be its private prompt (query plus its own top-1 retrieval). For branch `b`:
+
+```text
+B_leaf_b  = Local(theta_l_b, x_l_b, incoming=())
+B_relay_b = Relay(theta_r_b, x_r_b, incoming=detach(B_leaf_b))
+Y         = Source(theta_s, x_s, incoming=[detach(B_relay_0),
+                                           detach(B_relay_1)])
+```
+
+`Local` and `Relay` both run the frozen decoder and emit one fresh `(m + 2)` KV
+block. `Relay` must merge child blocks and its private prompt before re-encoding;
+it may not forward a child block unchanged. The source consumes only the two
+relay blocks in deterministic branch order. The source does not consume leaf
+blocks. Child blocks are detached at every node boundary, so no autograd graph
+crosses an edge; the message tensors remain valid serialized payloads.
+
+The same route record must contain sender, receiver, round, message kind,
+block shape, and wire bytes. Every send is checked against `A` and the per-round
+fan-out `k`.
+
+#### 13.3 Training objective
+
+The purpose of training is twofold: every node must produce a useful message
+from local evidence, and every relay must preserve useful information while
+aggregating a child message. Therefore train the two modes with explicit
+role-balanced losses, not one ambiguous mean over all nodes:
+
+```text
+L_leaf  = CE(y | public_query, B_leaf)
+L_relay = CE(y | public_query, B_relay)
+L_src   = CE(y | x_s, [B_relay_0, B_relay_1])
+L_total = lambda_leaf * L_leaf
+        + lambda_relay * L_relay
+        + lambda_src * L_src
+```
+
+`public_query` is the host question only; it contains no other agent's private
+retrieval. It gives leaf and relay blocks a source-independent answer-semantic
+target. `L_src` is the actual end-to-end objective and is computed only at the
+source using its private prompt and returned relay blocks. A source cannot use
+another node's private prompt to form a loss. The default weights are
+`lambda_leaf=lambda_relay=0.5` and `lambda_src=1.0`; keep them explicit in the
+checkpoint and ablate them later.
+
+Each node must receive both local and relay examples over training. Rotate the
+source assignment and branch roles so every node is a leaf, relay, and source
+on comparable numbers of episodes. A node's local update may use only its own
+private prompt, public query, target, and detached received blocks. The source
+loss updates only the source replica; the leaf/relay losses provide the local
+credit needed to train message semantics without cross-node gradients.
+
+#### 13.4 Synchronous optimizer and gossip semantics
+
+One training step is a synchronous snapshot:
+
+1. Freeze all replicas at `theta_i^t`.
+2. Build all leaf blocks, relay blocks, and source predictions for the selected
+   episodes using only `theta^t`. A block produced in this step must not be
+   consumed by a node after that node has already updated.
+3. Accumulate gradients separately for each node from its role losses. Child
+   blocks are detached, but gradients through the active node's own rollout are
+   retained.
+4. Apply every node optimizer step atomically to obtain `theta_i^(t+1)`.
+5. Every `G` steps, snapshot `theta_i^(t+1)` and perform one atomic symmetric
+   Metropolis gossip update over graph neighbors. No optimizer state is averaged;
+   use plain SGD or reset momentum after gossip.
+
+The initial validation setting is `G=1`; `G=4,8,16` are later ablations. Batch
+construction must shuffle or interleave source IDs before forming batches. It
+must not group all examples from one source across the entire run. Log update
+counts and role counts per node so non-IID imbalance is visible.
+
+#### 13.5 Evaluation contract
+
+Evaluation loads the per-node replicas without averaging them into one model and
+reuses the exact route builder and forward graph from Section 13.1-13.2. The
+primary method is one valid two-hop return protocol:
+
+```text
+leaf local block -> relay re-encoded block -> source prediction
+```
+
+The evaluator must emit a round/event trace and reject any trace containing a
+non-edge send, a leaf-to-source send, a relay that did not re-encode its child,
+or a source prediction formed before both relay blocks arrived. Count the two
+latent return sends per branch (four latent sends total for two branches), plus
+request messages if those are materialized by the runtime.
+
+Required comparisons on the same episodes and source assignments:
+
+1. `source_only`: source private prompt, no messages;
+2. `full_2hop`: leaf -> relay -> source, using the trained node replicas;
+3. `leaf_ablation`: replace one branch with no block, but retain the valid route;
+4. `relay_ablation`: use an untrained/frozen relay control to measure the value
+   of re-encoding; never replace it with a direct leaf -> source shortcut;
+5. M3 centralized oracle and independent-local replicas as training baselines.
+
+Report end-to-end source loss/accuracy first, then `L_leaf`/`L_relay` proxy
+losses, per-node/per-role accuracy, source-local versus remote-evidence strata,
+latent bytes/messages, latency, peak memory, parameter drift from initialization,
+and consensus distance. Consensus distance is a synchronization diagnostic, not
+a convergence or utility metric. Save per-query predictions and route traces.
+
+M4 is complete only when (a) all sends obey the fixed graph and two-hop route,
+(b) training and evaluation use the same leaf/relay/source computation graph,
+(c) every node is trained in both message modes, and (d) `full_2hop` is compared
+with `source_only`, M3, and independent-local controls on matched q4r6 splits.
+Topology changes, learned routing, privacy attacks, and scaling beyond the pilot
+remain later work.
 
 ## 14. Open Decisions
 
@@ -912,47 +1043,39 @@ canonical result existed. Do not complete those tasks under their old scope.
 
 ### 15.5 M4 - Decentralized latent-interface training
 
-- [ ] **L4.1 - Local training replicas and privacy boundary.** Replace the
-  single shared M3 distiller with one local `LatentDistiller` and boundary copy
-  per pilot agent while keeping the Qwen backbone frozen. Reuse the q4r6 query
-  split and five-agent seeded shortcut graph; each node must construct local
-  prompts and compute local/relay losses without a process-level batch containing
-  all hospitals' private prompts. **Files:** `medlatent/distributed/latent.py`
-  adds a node-local training step and explicit `local`/`relay` mode;
-  `medlatent/distributed/medical.py` exposes per-agent query/retrieval batches;
-  `medlatent/distributed/agent.py` or a small existing helper stores local
-  trainable interface state without exposing another store;
-  `scripts/train_distributed_latent.py` gains a decentralized-training mode;
-  tests cover local-only data flow, detached incoming blocks, frozen backbone,
-  and identical parameter shapes across nodes. **Done when:** a five-node CPU
-  smoke runs one local and one relay update per node with no central loss over
-  all private stores. **REOPENED (2026-09-22 review):** the trainer must use
-  graph-routed relay outputs and node-local store ownership before completion.
-- [ ] **L4.2 - Peer-to-peer synchronization.** Implement periodic graph gossip
-  for only the trainable distiller/boundary state (or compact deltas), with no
-  parameter server and no central gradient aggregation. Start with deterministic
-  weighted neighbor averaging; optionally add a local consensus penalty, but do
-  not introduce learned routing or topology changes. **Files:** add the
-  synchronization helper in `medlatent/distributed/latent.py` or an existing
-  runtime module; extend checkpoint metadata with node states, gossip rounds,
-  mixing weights, local steps, and seeds; update the training CLI for local
-  steps and sync interval; add tests for symmetric mixing, reproducibility,
-  state-shape validation, and consensus-distance reduction. **Done when:** all
-  nodes can train and synchronize over the fixed graph, no central model is
-  required after initialization, and local losses remain finite. **REOPENED
-  (2026-09-22 review):** verify gossip after the corrected node-local route and
-  initialization/optimizer semantics.
-- [ ] **L4.3 - Decentralized evaluation and ablations.** Compare M4 with the
-  M3 centralized checkpoint/oracle and independent local distillers on the same
-  q4r6 pilot and held-out queries. Keep inference fixed: local encoding and
-  relay aggregation, `R=4`, `k=2`, no learned routing. **Files:** add or extend
-  `scripts/evaluate_distributed_latent.py` for per-node checkpoints and gossip
-  traces; extend latent summaries with utility, latent drift/consensus,
-  peer-update bytes, inference bytes, latency, peak memory, and non-IID shard
-  strata; add focused tests for checkpoint compatibility and deterministic
-  result aggregation. **Done when:** one table separates the cost of training
-  synchronization from inference communication and shows whether decentralized
-  training preserves M3 utility.
+- [x] **L4.1 - Canonical two-hop computation graph and role losses.** Replace
+  the current source-rooted training route with the single canonical return
+  route `source <- relay <- leaf` defined in Section 13.1. Implement one shared
+  route builder used by training and evaluation; reject routes without two
+  node-disjoint two-hop branches. Add explicit `L_leaf`, `L_relay`, and `L_src`
+  losses from Section 13.3, role rotation so every node trains all three roles,
+  node-local store ownership, detached child blocks, and a frozen backbone.
+  **Files:** `medlatent/distributed/latent.py`,
+  `medlatent/distributed/medical.py`, and focused unit tests. **Done when:** a
+  CPU fixture proves that a leaf is trained in local mode, a relay receives the
+  leaf block and re-encodes it, the source consumes only relay blocks, and all
+  sends follow graph edges. **DONE (2026-09-23; focused latent tests 18 passed).**
+- [ ] **L4.2 - Synchronous decentralized optimizer and gossip.** Implement the
+  snapshot algorithm in Section 13.4: forward all roles from `theta^t`, compute
+  per-node gradients, apply optimizer steps atomically, then gossip atomically
+  after `G` steps. Start with `G=1`, plain SGD, and symmetric Metropolis mixing;
+  add `G=4,8,16` only as ablations. Shuffle/interleave source IDs before
+  batching. Checkpoint role counts, per-role losses/EMA, node states, gossip
+  rounds, mixing weights, and parameter drift. **Done when:** a test detects
+  that no post-update block is consumed in the same step and gossip preserves
+  graph locality, shape validity, and reproducibility.
+- [ ] **L4.3 - Protocol-faithful decentralized evaluation.** Rewrite
+  `scripts/evaluate_distributed_latent.py` to load per-node replicas and reuse
+  the L4.1 route/forward function. The primary method is `full_2hop` only:
+  `leaf -> relay -> source`; do not expose a leaf-to-source shortcut as a
+  decentralized method. Add `source_only`, `leaf_ablation`, and
+  `relay_ablation` controls that preserve valid graph routes. Emit round/event
+  traces and reject non-edge sends, direct leaf-to-source sends, missing relay
+  re-encoding, or early source prediction. Report source CE/accuracy first,
+  then role losses, per-node/per-role utility, evidence strata, bytes/messages,
+  latency, memory, drift, and consensus. **Done when:** matched q4r6 runs
+  compare `full_2hop` with source-only, M3 oracle, and independent-local
+  controls and separate synchronization cost from inference cost.
 
 ### 15.6 Later work, not active tasks
 
@@ -980,6 +1103,8 @@ notes rather than expanding this table indefinitely.
 | 2026-09-22 | Implement graph gossip synchronization | L4.2 | `DecentralizedMAS`: `python -m pytest -q` (38 passed) | Symmetric Metropolis mixing, atomic node-state updates, sync interval CLI, and checkpoint gossip metadata; no parameter server |
 | 2026-09-22 | Implement local latent replicas and privacy boundary | L4.1 | `DecentralizedMAS`: `python -m pytest -q` (35 passed) | Per-node distiller/boundary, explicit local/relay updates with detached incoming KV, agent-local retrieval/prompt batches, and decentralized CLI mode; backbone remains frozen |
 | 2026-09-22 | Promote decentralized latent training to M4 | M4 planning | Documentation-only; M3 retained as centralized oracle and M4 defined as local replicas plus graph gossip | Keep local/relay modes, frozen backbone, fixed sparse graph, and no learned routing |
+| 2026-09-23 | Redesign M4 training/evaluation contract | L4.1-L4.3 | Documentation-only; canonical route is `source <- relay <- leaf`, with role-balanced losses, synchronous snapshots, and protocol-faithful evaluation | Replaces source-rooted relay training and leaf-to-source evaluation shortcuts; implementation must share one route builder |
+| 2026-09-23 | Implement canonical L4.1 route and role losses | L4.1 | `DecentralizedMAS`: focused latent/medical tests (18 passed) | Strict two-branch graph route, public-query leaf/relay losses, detached child blocks, source-only relay consumption, deterministic role interleaving |
 | 2026-09-05/06 | M0/M1 and medical/text substrate | FOUNDATION | M1 verification note; distributed suite and CPU smoke passed | Foundation frozen |
 | 2026-09-07 | Evidence-distance and remote-necessity fixes | M205, M206 | Commit `bd5d825`; 56 tests passed | Preserve the corrected concepts/tests where relevant; modules may be removed |
 | 2026-09-07 | Generalized experiment layer | retired M207-M209 | Uncommitted working tree | Reviewed as excessive for the current question |
