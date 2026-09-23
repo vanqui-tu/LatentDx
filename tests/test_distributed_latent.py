@@ -6,7 +6,7 @@ from medlatent.distributed.latent import (
     graph_broadcast_tree, interface_consensus_distance, load_decentralized_latent_checkpoint, load_distributed_latent_checkpoint,
     merge_kv_blocks, metropolis_mixing_weights, save_decentralized_latent_checkpoint,
     batched_relay_aggregate, batched_rollout, ring_two_hop_branches, save_distributed_latent_checkpoint,
-    slice_kv_block, tiny_overfit, graph_two_hop_branches,
+    slice_kv_block, tiny_overfit, graph_two_hop_branches, synchronous_decentralized_step,
 )
 from medlatent.modules import BoundaryEmbeddings, LatentDistiller
 from medlatent.distributed.graph import path_graph, ring_graph
@@ -341,3 +341,40 @@ def test_m4_canonical_loss_uses_leaf_relay_source_roles():
     assert result["leaf_loss"].ndim == result["relay_loss"].ndim == result["source_loss"].ndim == 0
     result["total_loss"].backward()
     assert any(parameter.grad is not None for parameter in nodes[0].parameters)
+
+
+def test_synchronous_step_forwards_from_one_parameter_snapshot():
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token = ""
+
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+            return " ".join(message["content"] for message in messages)
+
+        def __call__(self, text, *, add_special_tokens, truncation, max_length):
+            return {"input_ids": [((ord(char) % 7) + 1) for char in text[:max_length]] or [1]}
+
+    class Store:
+        def __init__(self, agent_id):
+            self.agent_id = agent_id
+
+        def retrieve(self, query, *, limit):
+            return (MedicalRetrievedRecord(f"record-{self.agent_id}", "Disease", "phenotype", 1.0),)
+
+    from medlatent.distributed.graph import ring_graph
+
+    graph = ring_graph(5)
+    episode = MedicalEpisode("train", MedicalQuery("q", ("HP:1",), "phenotype"), "Disease", 0)
+    model = _Model()
+    nodes = {index: DecentralizedLatentNode(index, model, 4, num_latents=2) for index in graph.agent_ids}
+    trainers = {
+        index: NodeLocalLatentTrainer(nodes[index], Store(index), tokenizer=Tokenizer(), hospital_id=index)
+        for index in graph.agent_ids
+    }
+    before = {
+        node_id: tuple(parameter.detach().clone() for parameter in node.parameters)
+        for node_id, node in nodes.items()
+    }
+    result = synchronous_decentralized_step(nodes=nodes, trainers=trainers, graph=graph, episode=episode)
+    assert torch.isfinite(result["total_loss"])
+    assert any(not torch.equal(old, new) for old, new in zip(before[0], nodes[0].parameters))

@@ -1055,7 +1055,7 @@ canonical result existed. Do not complete those tasks under their old scope.
   CPU fixture proves that a leaf is trained in local mode, a relay receives the
   leaf block and re-encodes it, the source consumes only relay blocks, and all
   sends follow graph edges. **DONE (2026-09-23; focused latent tests 18 passed).**
-- [ ] **L4.2 - Synchronous decentralized optimizer and gossip.** Implement the
+- [x] **L4.2 - Synchronous decentralized optimizer and gossip.** Implement the
   snapshot algorithm in Section 13.4: forward all roles from `theta^t`, compute
   per-node gradients, apply optimizer steps atomically, then gossip atomically
   after `G` steps. Start with `G=1`, plain SGD, and symmetric Metropolis mixing;
@@ -1063,7 +1063,8 @@ canonical result existed. Do not complete those tasks under their old scope.
   batching. Checkpoint role counts, per-role losses/EMA, node states, gossip
   rounds, mixing weights, and parameter drift. **Done when:** a test detects
   that no post-update block is consumed in the same step and gossip preserves
-  graph locality, shape validity, and reproducibility.
+  graph locality, shape validity, and reproducibility. **DONE (2026-09-23;
+  focused latent tests 17 passed).**
 - [ ] **L4.3 - Protocol-faithful decentralized evaluation.** Rewrite
   `scripts/evaluate_distributed_latent.py` to load per-node replicas and reuse
   the L4.1 route/forward function. The primary method is `full_2hop` only:
@@ -1105,6 +1106,7 @@ notes rather than expanding this table indefinitely.
 | 2026-09-22 | Promote decentralized latent training to M4 | M4 planning | Documentation-only; M3 retained as centralized oracle and M4 defined as local replicas plus graph gossip | Keep local/relay modes, frozen backbone, fixed sparse graph, and no learned routing |
 | 2026-09-23 | Redesign M4 training/evaluation contract | L4.1-L4.3 | Documentation-only; canonical route is `source <- relay <- leaf`, with role-balanced losses, synchronous snapshots, and protocol-faithful evaluation | Replaces source-rooted relay training and leaf-to-source evaluation shortcuts; implementation must share one route builder |
 | 2026-09-23 | Implement canonical L4.1 route and role losses | L4.1 | `DecentralizedMAS`: focused latent/medical tests (18 passed) | Strict two-branch graph route, public-query leaf/relay losses, detached child blocks, source-only relay consumption, deterministic role interleaving |
+| 2026-09-23 | Implement L4.2 snapshot SGD and gossip | L4.2 | `DecentralizedMAS`: full suite (43 passed) | Atomic forward/gradient/update ordering, G-step Metropolis gossip, role counts/EMA and parameter drift checkpoint metadata |
 | 2026-09-05/06 | M0/M1 and medical/text substrate | FOUNDATION | M1 verification note; distributed suite and CPU smoke passed | Foundation frozen |
 | 2026-09-07 | Evidence-distance and remote-necessity fixes | M205, M206 | Commit `bd5d825`; 56 tests passed | Preserve the corrected concepts/tests where relevant; modules may be removed |
 | 2026-09-07 | Generalized experiment layer | retired M207-M209 | Uncommitted working tree | Reviewed as excessive for the current question |

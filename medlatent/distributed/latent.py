@@ -660,6 +660,29 @@ def canonical_two_hop_losses(
     }
 
 
+def synchronous_decentralized_step(
+    *, nodes: Mapping[int, DecentralizedLatentNode],
+    trainers: Mapping[int, NodeLocalLatentTrainer], graph: Any, episode: Any,
+) -> dict[str, Any]:
+    """Run one snapshot update: forward, backward, then update every node."""
+    before = _node_parameter_snapshots(nodes, graph)
+    for node in nodes.values():
+        node.optimizer.zero_grad(set_to_none=True)
+    result = canonical_two_hop_losses(nodes=nodes, trainers=trainers, graph=graph, episode=episode)
+    # No optimizer step is legal until every role has been forwarded.
+    after_forward = _node_parameter_snapshots(nodes, graph)
+    for node_id in before:
+        for name in before[node_id]:
+            if not torch.equal(before[node_id][name], after_forward[node_id][name]):
+                raise RuntimeError("node parameters changed during synchronous forward")
+    result["total_loss"].backward()
+    for node in nodes.values():
+        torch.nn.utils.clip_grad_norm_(node.parameters, 1.0)
+    for node in nodes.values():
+        node.optimizer.step()
+    return result
+
+
 def metropolis_mixing_weights(graph: Any) -> dict[int, dict[int, float]]:
     """Return deterministic symmetric, row-stochastic graph mixing weights."""
     if not hasattr(graph, "agent_ids") or not hasattr(graph, "neighbors"):
@@ -743,6 +766,20 @@ def interface_consensus_distance(nodes: Mapping[int, DecentralizedLatentNode], g
                for agent_id in graph.agent_ids]
     centroid = torch.stack(vectors).mean(dim=0)
     return float(torch.stack([(vector - centroid).pow(2).mean() for vector in vectors]).mean().sqrt())
+
+
+def _interface_parameter_drift(
+    nodes: Mapping[int, DecentralizedLatentNode],
+    initial: Mapping[int, Mapping[str, torch.Tensor]], graph: Any,
+) -> dict[int, float]:
+    current = _node_parameter_snapshots(nodes, graph)
+    return {
+        node_id: float(torch.stack([
+            (current[node_id][name].float() - initial[node_id][name].float()).pow(2).mean()
+            for name in initial[node_id]
+        ]).mean().sqrt())
+        for node_id in graph.agent_ids
+    }
 
 # NOTE: Unused - Legacy
 # def two_hop_ring_blocks(protocol: DistributedLatentProtocol, *, leaf_ids: torch.Tensor,
@@ -1141,7 +1178,7 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
     random.Random(seed).shuffle(scheduled)
     batches = [scheduled[start:start + batch_size]
                for start in range(0, len(scheduled), batch_size)]
-    total_steps = len(batches)
+    total_steps = len(scheduled)
     hidden_size = int(model.config.hidden_size)
     dtype = model.get_input_embeddings().weight.dtype
     from .medical import load_hospital_private_stores
@@ -1160,6 +1197,7 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
         node.distiller.load_state_dict(reference.distiller.state_dict())
         node.boundary.load_state_dict(reference.boundary.state_dict())
         nodes[node_id] = node
+    initial_interfaces = _node_parameter_snapshots(nodes, graph)
     trainers = {}
     for node_id in nodes:
         local_store = load_hospital_private_stores(
@@ -1175,38 +1213,51 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
     losses: list[float] = []
     gossip_rounds = 0
     mixing_weights = metropolis_mixing_weights(graph)
+    role_counts = {node_id: {role: 0 for role in ("leaf", "relay", "source")} for node_id in nodes}
+    role_loss_ema = {node_id: {role: None for role in ("leaf", "relay", "source")} for node_id in nodes}
     log_interval = max(1, sync_interval)
     print(
-        f"decentralized train: episodes={total_episodes} batches={total_steps} "
+        f"decentralized train: episodes={total_episodes} updates={total_steps} "
         f"batch_size={batch_size} nodes={len(nodes)} epochs={epochs} sync_interval={sync_interval}",
         flush=True,
     )
-    for step, batch in enumerate(batches):
-        step_losses: list[float] = []
+    step = 0
+    for batch in batches:
         for episode in batch:
-            for node in nodes.values():
-                node.optimizer.zero_grad(set_to_none=True)
-            result = canonical_two_hop_losses(
+            step += 1
+            result = synchronous_decentralized_step(
                 nodes=nodes, trainers=trainers, graph=graph, episode=episode,
             )
-            result["total_loss"].backward()
-            for node in nodes.values():
-                torch.nn.utils.clip_grad_norm_(node.parameters, 1.0)
-                node.optimizer.step()
             value = float(result["total_loss"].detach().cpu())
             losses.append(value)
-            step_losses.append(value)
-        if (step + 1) % sync_interval == 0:
-            mixing_weights = gossip_node_interfaces(nodes, graph, mixing_weights=mixing_weights)
-            gossip_rounds += 1
-        if step == 0 or (step + 1) % log_interval == 0 or step + 1 == total_steps:
-            gossip_note = f" gossip_round={gossip_rounds}" if (step + 1) % sync_interval == 0 else ""
-            print(
-                f"decentralized train: step={step + 1}/{total_steps} "
-                f"source={episode.source_id} mean_loss={sum(step_losses) / len(step_losses):.4f} "
-                f"elapsed={time.perf_counter() - start_time:.1f}s{gossip_note}",
-                flush=True,
+            role_values = {
+                "leaf": float(result["leaf_loss"].detach().cpu()),
+                "relay": float(result["relay_loss"].detach().cpu()),
+                "source": float(result["source_loss"].detach().cpu()),
+            }
+            for leaf_id, relay_id in graph_two_hop_branches(graph, episode.source_id):
+                for node_id, role in ((leaf_id, "leaf"), (relay_id, "relay")):
+                    role_counts[node_id][role] += 1
+                    previous = role_loss_ema[node_id][role]
+                    role_loss_ema[node_id][role] = role_values[role] if previous is None else (
+                        0.9 * previous + 0.1 * role_values[role]
+                    )
+            role_counts[episode.source_id]["source"] += 1
+            previous = role_loss_ema[episode.source_id]["source"]
+            role_loss_ema[episode.source_id]["source"] = role_values["source"] if previous is None else (
+                0.9 * previous + 0.1 * role_values["source"]
             )
+            if step % sync_interval == 0:
+                mixing_weights = gossip_node_interfaces(nodes, graph, mixing_weights=mixing_weights)
+                gossip_rounds += 1
+            if step == 1 or step % log_interval == 0 or step == total_steps:
+                gossip_note = f" gossip_round={gossip_rounds}" if step % sync_interval == 0 else ""
+                print(
+                    f"decentralized train: step={step}/{total_steps} "
+                    f"source={episode.source_id} loss={value:.4f} "
+                    f"elapsed={time.perf_counter() - start_time:.1f}s{gossip_note}",
+                    flush=True,
+                )
     elapsed_seconds = time.perf_counter() - start_time
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -1222,6 +1273,8 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
                   "local_steps": local_steps, "total_steps": total_steps,
                   "sync_interval": sync_interval, "seed": seed, "updates": len(losses),
                   "role_loss_weights": {"leaf": 0.5, "relay": 0.5, "source": 1.0},
+                  "role_counts": role_counts, "role_loss_ema": role_loss_ema,
+                  "parameter_drift": _interface_parameter_drift(nodes, initial_interfaces, graph),
                   "last_loss": losses[-1] if losses else float("nan"),
                   "elapsed_seconds": elapsed_seconds},
     )
@@ -1237,7 +1290,7 @@ __all__ = [
     "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block", "kv_wire_bytes",
     "batched_rollout", "batched_relay_aggregate",
     "accumulation_steps_for",
-    "ring_two_hop_branches", "graph_two_hop_branches", "build_two_hop_route", "canonical_two_hop_losses", "graph_broadcast_tree",
+    "ring_two_hop_branches", "graph_two_hop_branches", "build_two_hop_route", "canonical_two_hop_losses", "synchronous_decentralized_step", "graph_broadcast_tree",
     "metropolis_mixing_weights", "gossip_node_interfaces", "interface_consensus_distance",
     "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",
     "save_decentralized_latent_checkpoint", "load_decentralized_latent_checkpoint",

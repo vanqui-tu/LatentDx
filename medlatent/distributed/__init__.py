@@ -20,7 +20,7 @@ from .latent import (
     DecentralizedLatentNode, DistributedLatentProtocol, KVBlock, LatentKVProtocol, NodeLocalLatentTrainer, accumulation_steps_for, batched_pilot_loss, batched_relay_aggregate, batched_rollout,
     detach_kv_block, gossip_node_interfaces, interface_consensus_distance, kv_wire_bytes,
     load_decentralized_latent_checkpoint, load_distributed_latent_checkpoint, metropolis_mixing_weights,
-    build_two_hop_route, canonical_two_hop_losses, graph_broadcast_tree, graph_two_hop_branches, merge_kv_blocks, ring_two_hop_branches, save_distributed_latent_checkpoint,
+    build_two_hop_route, canonical_two_hop_losses, graph_broadcast_tree, graph_two_hop_branches, merge_kv_blocks, ring_two_hop_branches, save_distributed_latent_checkpoint, synchronous_decentralized_step,
     save_decentralized_latent_checkpoint, select_kv_rows, slice_kv_block, tiny_overfit, train_distributed_latent_real
 )
 
@@ -38,7 +38,7 @@ __all__ = [
     "TextGeneration", "TextGenerator", "TransformersTextGenerator", "VllmTextGenerator", "build_agent_prompt", "build_host_prompt", "parse_textmas_answer",
     "DistributedLatentProtocol", "DecentralizedLatentNode", "NodeLocalLatentTrainer", "LatentKVProtocol", "KVBlock", "merge_kv_blocks", "slice_kv_block", "select_kv_rows", "detach_kv_block",
     "batched_rollout", "batched_relay_aggregate", "batched_pilot_loss", "tiny_overfit", "accumulation_steps_for", "kv_wire_bytes",
-    "ring_two_hop_branches", "graph_two_hop_branches", "build_two_hop_route", "canonical_two_hop_losses", "graph_broadcast_tree",
+    "ring_two_hop_branches", "graph_two_hop_branches", "build_two_hop_route", "canonical_two_hop_losses", "synchronous_decentralized_step", "graph_broadcast_tree",
     "metropolis_mixing_weights", "gossip_node_interfaces", "interface_consensus_distance",
     "save_distributed_latent_checkpoint", "load_distributed_latent_checkpoint",
     "save_decentralized_latent_checkpoint", "load_decentralized_latent_checkpoint",
