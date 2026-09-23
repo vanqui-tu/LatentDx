@@ -10,6 +10,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -40,8 +41,8 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_protocol(checkpoint_path: Path, model_name: str | None, device: torch.device, dtype: torch.dtype, local_files_only: bool):
-    payload = load_distributed_latent_checkpoint(checkpoint_path, map_location="cpu")
+def _load_model_and_tokenizer(payload, model_name: str | None, device: torch.device,
+                              dtype: torch.dtype, local_files_only: bool):
     resolved_model = model_name or str(payload["model_name"])
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -51,8 +52,10 @@ def _load_protocol(checkpoint_path: Path, model_name: str | None, device: torch.
     model = AutoModelForCausalLM.from_pretrained(
         resolved_model, trust_remote_code=True, local_files_only=local_files_only, torch_dtype=dtype,
     ).to(device)
-    distiller_state = payload["distiller"]
-    boundary_state = payload["boundary"]
+    return model, tokenizer, resolved_model
+
+
+def _build_protocol(model, distiller_state, boundary_state, payload, device, dtype):
     hidden_size = int(distiller_state["hidden_size"])
     distiller = LatentDistiller(hidden_size).to(device=device, dtype=dtype)
     distiller.projection.load_state_dict(distiller_state["projection_state_dict"])
@@ -63,7 +66,38 @@ def _load_protocol(checkpoint_path: Path, model_name: str | None, device: torch.
     protocol = DistributedLatentProtocol(model, distiller, boundary, num_latents=int(payload["num_latents"]))
     protocol.distiller.eval()
     protocol.boundary.eval()
+    return protocol
+
+
+def _load_protocol(checkpoint_path: Path, model_name: str | None, device: torch.device, dtype: torch.dtype, local_files_only: bool):
+    payload = load_distributed_latent_checkpoint(checkpoint_path, map_location="cpu")
+    if payload.get("module_type") == "DecentralizedLatentKV":
+        raise ValueError("decentralized checkpoint requires _load_decentralized_protocols")
+    model, tokenizer, resolved_model = _load_model_and_tokenizer(
+        payload, model_name, device, dtype, local_files_only,
+    )
+    protocol = _build_protocol(
+        model, payload["distiller"], payload["boundary"], payload, device, dtype,
+    )
     return protocol, tokenizer, payload, resolved_model
+
+
+def _load_decentralized_protocols(checkpoint_path: Path, model_name: str | None,
+                                  device: torch.device, dtype: torch.dtype,
+                                  local_files_only: bool):
+    payload = load_distributed_latent_checkpoint(checkpoint_path, map_location="cpu")
+    if payload.get("module_type") != "DecentralizedLatentKV":
+        raise ValueError("expected a DecentralizedLatentKV checkpoint")
+    model, tokenizer, resolved_model = _load_model_and_tokenizer(
+        payload, model_name, device, dtype, local_files_only,
+    )
+    protocols = {}
+    for node_id, state in sorted(payload["nodes"].items(), key=lambda item: int(item[0])):
+        protocol = _build_protocol(
+            model, state["distiller"], state["boundary"], payload, device, dtype,
+        )
+        protocols[int(node_id)] = protocol
+    return protocols, tokenizer, payload, resolved_model
 
 
 def _prediction(tokenizer, token_ids: torch.Tensor) -> str:
@@ -150,6 +184,111 @@ def _evaluate_method(*, method: str, protocol: DistributedLatentProtocol, tokeni
     return rows, total_seconds, peak
 
 
+def _evaluate_decentralized_method(*, method: str, protocols: dict[int, DistributedLatentProtocol],
+                                   tokenizer, episodes, rows_by_case, graph, batch_size: int,
+                                   pad_token_id: int, max_new_tokens: int, device: torch.device,
+                                   gold_agents: dict[str, set[int]]) -> tuple[list[dict[str, object]], float, int]:
+    """Evaluate per-node interfaces while preserving one fixed source route per batch."""
+    rows: list[dict[str, object]] = []
+    total_seconds = 0.0
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    grouped: dict[int, list[Any]] = {}
+    for episode in episodes:
+        grouped.setdefault(episode.source_id, []).append(episode)
+    batches = [grouped[source][start:start + batch_size]
+               for source in sorted(grouped)
+               for start in range(0, len(grouped[source]), batch_size)]
+    with torch.no_grad():
+        for batch in batches:
+            tensors = _pilot_batch_tensors(
+                episodes=batch, rows_by_case=rows_by_case, graph=graph,
+                pad_token_id=pad_token_id, device=device,
+            )
+            started = time.perf_counter()
+            routes = [graph_two_hop_branches(graph, batch[0].source_id)] * len(batch)
+            if method == "decentralized_local":
+                branches = []
+                messages = 2
+                for branch in (0, 1):
+                    leaf, _ = routes[0][branch]
+                    indices = list(range(branch, len(batch) * 2, 2))
+                    leaf_ids = tensors["leaf_ids"][indices]
+                    leaf_mask = tensors["leaf_mask"][indices]
+                    branches.append(protocols[leaf].rollout(leaf_ids, leaf_mask))
+            elif method == "decentralized_relay":
+                branches = []
+                messages = 4
+                for branch in (0, 1):
+                    leaf, relay = routes[0][branch]
+                    indices = list(range(branch, len(batch) * 2, 2))
+                    leaf_block = protocols[leaf].rollout(
+                        tensors["leaf_ids"][indices], tensors["leaf_mask"][indices],
+                    )
+                    branches.append(protocols[relay].relay_rollout(
+                        tensors["relay_ids"][indices], tensors["relay_mask"][indices],
+                        [leaf_block], detach_children=True,
+                    ))
+            else:
+                raise ValueError(f"unknown decentralized method: {method}")
+            source_protocol = protocols[batch[0].source_id]
+            generated = source_protocol.generate(
+                tensors["source_ids"], tensors["source_mask"], tuple(branches),
+                max_new_tokens=max_new_tokens, eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            elapsed = time.perf_counter() - started
+            total_seconds += elapsed
+            one_branch = select_kv_rows(branches[0], 0)
+            latent_bytes = messages * sum(
+                int(key.numel() * key.element_size() + value.numel() * value.element_size())
+                for key, value in one_branch
+            ) + 32 * messages
+            for index, episode in enumerate(batch):
+                prediction = _prediction(tokenizer, generated[index])
+                useful = gold_agents.get(episode.query.case_id, set())
+                stratum = "source_local" if episode.source_id in useful else ("remote" if useful else "none")
+                rows.append({
+                    "case_id": episode.query.case_id,
+                    "source_id": episode.source_id,
+                    "method": method,
+                    "prediction": prediction,
+                    "target": episode.target_label,
+                    "correct": prediction_matches_target(prediction, episode),
+                    "evidence_stratum": stratum,
+                    "contacted_agent_ids": sorted({node for route in routes[index] for node in route}),
+                    "messages": messages,
+                    "latent_bytes": latent_bytes,
+                    "route": [list(route) for route in routes[index]],
+                    "latency_seconds": elapsed / max(1, len(batch)),
+                })
+    peak = int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
+    return rows, total_seconds, peak
+
+
+def _checkpoint_interface_metrics(payload: dict[str, object]) -> dict[str, float]:
+    """Compute parameter consensus and peer-update bytes from a node checkpoint."""
+    nodes = payload.get("nodes", {})
+    if not nodes:
+        return {"interface_consensus_distance": 0.0, "peer_update_bytes": 0.0}
+    vectors = []
+    parameter_bytes = 0
+    for state in nodes.values():
+        tensors = list(state["distiller"]["projection_state_dict"].values())
+        tensors.append(state["distiller"]["latent_begin"])
+        tensors.extend((state["boundary"]["begin"], state["boundary"]["end"]))
+        vectors.append(torch.cat([tensor.float().reshape(-1) for tensor in tensors]))
+        parameter_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+    stacked = torch.stack(vectors)
+    distance = float((stacked - stacked.mean(dim=0)).pow(2).mean(dim=1).mean().sqrt())
+    rounds = int(payload.get("gossip", {}).get("rounds", 0))
+    edges = len(payload.get("route", {}).get("graph_edges", ()))
+    return {
+        "interface_consensus_distance": distance,
+        "peer_update_bytes": float(rounds * edges * 2 * parameter_bytes),
+    }
+
+
 def _accuracy_by_stratum(rows: list[dict[str, object]]) -> dict[str, float]:
     result: dict[str, float] = {}
     for stratum in ("source_local", "remote", "none"):
@@ -170,8 +309,9 @@ def main() -> None:
     parser.add_argument("--model_name", default=None)
     parser.add_argument("--hospital_ids", type=int, nargs="+", default=None)
     parser.add_argument("--num_agents", type=int, default=None)
-    parser.add_argument("--methods", nargs="+", default=["local_only", "latent_local", "latent_relay"],
-                        choices=["local_only", "latent_local", "latent_relay"])
+    parser.add_argument("--methods", nargs="+", default=None,
+                        choices=["local_only", "latent_local", "latent_relay",
+                                 "decentralized_local", "decentralized_relay"])
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--max_new_tokens", type=int, default=64)
@@ -194,7 +334,21 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
-    protocol, tokenizer, payload, model_name = _load_protocol(args.checkpoint, args.model_name, device, dtype, args.local_files_only)
+    decentralized = payload.get("module_type") == "DecentralizedLatentKV"
+    methods = args.methods or (["local_only", "decentralized_local", "decentralized_relay"]
+                               if decentralized else ["local_only", "latent_local", "latent_relay"])
+    if decentralized:
+        protocols, tokenizer, payload, model_name = _load_decentralized_protocols(
+            args.checkpoint, args.model_name, device, dtype, args.local_files_only,
+        )
+        if any(method in {"latent_local", "latent_relay"} for method in methods):
+            parser.error("use decentralized_local/decentralized_relay for a decentralized checkpoint")
+    else:
+        protocol, tokenizer, payload, model_name = _load_protocol(
+            args.checkpoint, args.model_name, device, dtype, args.local_files_only,
+        )
+        if any(method.startswith("decentralized_") for method in methods):
+            parser.error("decentralized_* methods require a DecentralizedLatentKV checkpoint")
     dataset = MedLatentDiagnosisDataset(
         data_file=args.query_file, hospital_dir=args.hospital_dir, tokenizer=tokenizer,
         num_hospitals=num_agents, hospital_ids=list(selected_ids),
@@ -237,13 +391,21 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summaries: dict[str, dict[str, float]] = {}
     peak_memory = 0
-    for method in args.methods:
-        method_rows, elapsed, method_peak = _evaluate_method(
-            method=method, protocol=protocol, tokenizer=tokenizer, episodes=episodes,
-            rows_by_case=rows_by_case, graph=graph, batch_size=args.batch_size,
-            pad_token_id=tokenizer.pad_token_id, max_new_tokens=args.max_new_tokens,
-            device=device, gold_agents=gold_agents,
-        )
+    for method in methods:
+        if method.startswith("decentralized_"):
+            method_rows, elapsed, method_peak = _evaluate_decentralized_method(
+                method=method, protocols=protocols, tokenizer=tokenizer, episodes=episodes,
+                rows_by_case=rows_by_case, graph=graph, batch_size=args.batch_size,
+                pad_token_id=tokenizer.pad_token_id, max_new_tokens=args.max_new_tokens,
+                device=device, gold_agents=gold_agents,
+            )
+        else:
+            method_rows, elapsed, method_peak = _evaluate_method(
+                method=method, protocol=protocol, tokenizer=tokenizer, episodes=episodes,
+                rows_by_case=rows_by_case, graph=graph, batch_size=args.batch_size,
+                pad_token_id=tokenizer.pad_token_id, max_new_tokens=args.max_new_tokens,
+                device=device, gold_agents=gold_agents,
+            )
         _write_jsonl(args.output_dir / f"{method}.jsonl", method_rows)
         count = len(method_rows)
         summaries[method] = {
@@ -267,6 +429,8 @@ def main() -> None:
         "m": int(payload["num_latents"]), "episodes": len(episodes),
         "peak_memory_bytes": peak_memory, "methods": summaries,
     }
+    if decentralized:
+        summary.update(_checkpoint_interface_metrics(payload))
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(f"distributed latent evaluation complete: output_dir={args.output_dir} episodes={len(episodes)}")
 
