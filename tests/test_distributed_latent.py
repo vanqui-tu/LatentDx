@@ -339,8 +339,11 @@ def test_m4_canonical_loss_uses_leaf_relay_source_roles():
     assert len(result["leaf_blocks"]) == len(result["relay_blocks"]) == 2
     assert all(not block[0][0].requires_grad for block in result["relay_blocks"])
     assert result["leaf_loss"].ndim == result["relay_loss"].ndim == result["source_loss"].ndim == 0
+    assert torch.allclose(result["total_loss"], 0.5 * (result["leaf_loss"] + result["relay_loss"]))
     result["total_loss"].backward()
-    assert any(parameter.grad is not None for parameter in nodes[0].parameters)
+    # Source consumes relay payloads directly; it does not re-encode them.
+    assert all(parameter.grad is None for parameter in nodes[0].parameters)
+    assert any(parameter.grad is not None for parameter in nodes[1].parameters)
 
 
 def test_synchronous_step_forwards_from_one_parameter_snapshot():
@@ -377,4 +380,4 @@ def test_synchronous_step_forwards_from_one_parameter_snapshot():
     }
     result = synchronous_decentralized_step(nodes=nodes, trainers=trainers, graph=graph, episode=episode)
     assert torch.isfinite(result["total_loss"])
-    assert any(not torch.equal(old, new) for old, new in zip(before[0], nodes[0].parameters))
+    assert any(not torch.equal(old, new) for old, new in zip(before[1], nodes[1].parameters))

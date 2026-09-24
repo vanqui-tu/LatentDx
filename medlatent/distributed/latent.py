@@ -30,6 +30,11 @@ from ..modules import BoundaryEmbeddings, LatentDistiller
 KVBlock = tuple[tuple[torch.Tensor, torch.Tensor], ...]
 
 
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    selected = values[mask]
+    return selected.mean() if selected.numel() else values.sum() * 0
+
+
 def _as_block(cache: Any) -> KVBlock:
     """Normalize a HF legacy/DynamicCache value without detaching tensors."""
     return tuple((key, value) for key, value in _iter_key_value_pairs(cache))
@@ -324,7 +329,7 @@ class DistributedLatentProtocol:
 
     def source_loss(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
                     target_ids: torch.Tensor, target_labels: torch.Tensor,
-                    branch_blocks: Sequence[KVBlock] = ()) -> torch.Tensor:
+                    branch_blocks: Sequence[KVBlock] = (), *, reduction: str = "mean") -> torch.Tensor:
         """Teacher-force a diagnosis after the source prompt and branch blocks."""
         if target_ids.ndim != 2 or target_labels.shape != target_ids.shape:
             raise ValueError("target_ids and target_labels must both be [batch, sequence]")
@@ -351,7 +356,10 @@ class DistributedLatentProtocol:
         target_logits = logits.gather(
             1, target_positions.unsqueeze(-1).expand(-1, -1, logits.shape[-1]),
         )
-        return diagnosis_cross_entropy(first, target_logits, target_labels, ignore_index=IGNORE_INDEX)
+        return diagnosis_cross_entropy(
+            first, target_logits, target_labels, ignore_index=IGNORE_INDEX,
+            reduction=reduction,
+        )
 
     def _source_sequence_logits(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
                                 branch_blocks: Sequence[KVBlock]) -> torch.Tensor:
@@ -452,7 +460,10 @@ class DecentralizedLatentNode:
                   public_ids: torch.Tensor, public_mask: torch.Tensor,
                   source_ids: torch.Tensor, source_mask: torch.Tensor,
                   target_ids: torch.Tensor, target_labels: torch.Tensor,
-                  incoming: Sequence[KVBlock] = ()) -> tuple[torch.Tensor, KVBlock | tuple[()]]:
+                  local_relevant: torch.Tensor,
+                  child_relevant: torch.Tensor | None = None,
+                  incoming: Sequence[KVBlock] = (),
+                  return_breakdown: bool = False) -> tuple[torch.Tensor, KVBlock | tuple[()]] | tuple[torch.Tensor, KVBlock | tuple[()], torch.Tensor, torch.Tensor]:
         """Compute one explicit M4 role loss and return its fresh block.
 
         Leaf and relay supervision uses only the public query.  The source
@@ -464,22 +475,41 @@ class DecentralizedLatentNode:
             if incoming:
                 raise ValueError("leaf role cannot receive incoming blocks")
             block = self.protocol.rollout(local_ids, local_mask)
-            loss = self.protocol.source_loss(public_ids, public_mask, target_ids, target_labels, (block,))
+            block_loss = self.protocol.source_loss(public_ids, public_mask, target_ids, target_labels, (block,), reduction="none")
+            empty_loss = self.protocol.source_loss(public_ids, public_mask, target_ids, target_labels, (), reduction="none")
+            relevant_loss = torch.where(local_relevant, block_loss, block_loss.new_zeros(block_loss.shape))
+            irrelevant_loss = torch.where(~local_relevant, (block_loss - empty_loss).clamp_min(0), block_loss.new_zeros(block_loss.shape))
         elif role == "relay":
             if len(incoming) != 1:
                 raise ValueError("relay role requires one leaf block")
             block = self.protocol.relay_rollout(local_ids, local_mask, incoming, detach_children=True)
-            loss = self.protocol.source_loss(public_ids, public_mask, target_ids, target_labels, (block,))
+            block_loss = self.protocol.source_loss(public_ids, public_mask, target_ids, target_labels, (block,), reduction="none")
+            if child_relevant is None:
+                raise ValueError("relay role requires child_relevant")
+            child_loss = self.protocol.source_loss(public_ids, public_mask, target_ids, target_labels, incoming, reduction="none")
+            empty_loss = self.protocol.source_loss(public_ids, public_mask, target_ids, target_labels, (), reduction="none")
+            relevant_loss = torch.where(local_relevant, block_loss, block_loss.new_zeros(block_loss.shape))
+            preserve_reference = torch.where(child_relevant, child_loss, empty_loss)
+            irrelevant_loss = torch.where(~local_relevant, (block_loss - preserve_reference).clamp_min(0), block_loss.new_zeros(block_loss.shape))
         elif role == "source":
             if len(incoming) != 2:
                 raise ValueError("source role requires two relay blocks")
-            # The source replica also participates in the interface: it
-            # consumes the two returned relay blocks with its private prompt,
-            # then predicts from that source-local representation.
-            block = self.protocol.rollout(local_ids, local_mask, incoming, detach_incoming=True)
-            loss = self.protocol.source_loss(source_ids, source_mask, target_ids, target_labels, (block,))
+            # Source consumes the two relay payloads directly.  Re-encoding at
+            # the source would add an extra protocol hop and is not part of M4.
+            block = tuple(incoming)
+            loss = self.protocol.source_loss(
+                source_ids, source_mask, target_ids, target_labels, incoming,
+            )
+            relevant_loss = loss.new_zeros(())
+            irrelevant_loss = loss.new_zeros(())
         else:
             raise ValueError("role must be 'leaf', 'relay', or 'source'")
+        if role != "source":
+            loss = (relevant_loss + irrelevant_loss).mean()
+            relevant_loss = _masked_mean(relevant_loss, local_relevant)
+            irrelevant_loss = _masked_mean(irrelevant_loss, ~local_relevant)
+        if return_breakdown:
+            return loss, block, relevant_loss, irrelevant_loss
         return loss, block
 
     def train_step(self, *, mode: str, local_ids: torch.Tensor,
@@ -584,6 +614,9 @@ class NodeLocalLatentTrainer:
             "source_ids": source_ids, "source_mask": source_mask,
             "target_ids": target_ids,
             "target_labels": target_ids.masked_fill(target_mask == 0, IGNORE_INDEX),
+            "local_relevant": torch.tensor(
+                [bool(row["local_relevant"]) for row in rows], dtype=torch.bool,
+            ),
         }
         return {key: value.to(self.device) for key, value in tensors.items()}
 
@@ -631,15 +664,25 @@ def canonical_two_hop_losses(
     relay_blocks: list[KVBlock] = []
     leaf_losses: list[torch.Tensor] = []
     relay_losses: list[torch.Tensor] = []
+    leaf_relevant_losses: list[torch.Tensor] = []
+    leaf_irrelevant_losses: list[torch.Tensor] = []
+    relay_relevant_losses: list[torch.Tensor] = []
+    relay_irrelevant_losses: list[torch.Tensor] = []
     for leaf_id, relay_id in branches:
         leaf_tensors = trainers[leaf_id].prepare_batch((episode,))
         relay_tensors = trainers[relay_id].prepare_batch((episode,))
-        leaf_loss, leaf_block = nodes[leaf_id].role_loss(role="leaf", **leaf_tensors)
-        relay_loss, relay_block = nodes[relay_id].role_loss(
-            role="relay", incoming=(detach_kv_block(leaf_block),), **relay_tensors,
+        leaf_loss, leaf_block, leaf_relevant_loss, leaf_irrelevant_loss = nodes[leaf_id].role_loss(
+            role="leaf", return_breakdown=True, **leaf_tensors)
+        relay_loss, relay_block, relay_relevant_loss, relay_irrelevant_loss = nodes[relay_id].role_loss(
+            role="relay", child_relevant=leaf_tensors["local_relevant"],
+            incoming=(detach_kv_block(leaf_block),), return_breakdown=True, **relay_tensors,
         )
         leaf_losses.append(leaf_loss)
         relay_losses.append(relay_loss)
+        leaf_relevant_losses.append(leaf_relevant_loss)
+        leaf_irrelevant_losses.append(leaf_irrelevant_loss)
+        relay_relevant_losses.append(relay_relevant_loss)
+        relay_irrelevant_losses.append(relay_irrelevant_loss)
         leaf_blocks.append(detach_kv_block(leaf_block))
         relay_blocks.append(detach_kv_block(relay_block))
     source_loss, _ = nodes[episode.source_id].role_loss(
@@ -647,7 +690,7 @@ def canonical_two_hop_losses(
     )
     leaf_loss = torch.stack(leaf_losses).mean()
     relay_loss = torch.stack(relay_losses).mean()
-    total = lambda_leaf * leaf_loss + lambda_relay * relay_loss + lambda_src * source_loss
+    total = lambda_leaf * leaf_loss + lambda_relay * relay_loss
     shape = tuple(int(value) for value in relay_blocks[0][0][0].shape) if relay_blocks else None
     return {
         "episode": episode,
@@ -657,6 +700,8 @@ def canonical_two_hop_losses(
         ),
         "leaf_blocks": tuple(leaf_blocks), "relay_blocks": tuple(relay_blocks),
         "leaf_loss": leaf_loss, "relay_loss": relay_loss, "source_loss": source_loss,
+        "leaf_relevant_loss": torch.stack(leaf_relevant_losses).mean(), "leaf_irrelevant_loss": torch.stack(leaf_irrelevant_losses).mean(),
+        "relay_relevant_loss": torch.stack(relay_relevant_losses).mean(), "relay_irrelevant_loss": torch.stack(relay_irrelevant_losses).mean(),
         "total_loss": total,
     }
 
@@ -679,16 +724,27 @@ def canonical_two_hop_losses_batch(
     relay_blocks: list[KVBlock] = []
     leaf_losses: list[torch.Tensor] = []
     relay_losses: list[torch.Tensor] = []
+    leaf_relevant_losses: list[torch.Tensor] = []
+    leaf_irrelevant_losses: list[torch.Tensor] = []
+    relay_relevant_losses: list[torch.Tensor] = []
+    relay_irrelevant_losses: list[torch.Tensor] = []
     for leaf_id, relay_id in branches:
-        leaf_loss, leaf_block = nodes[leaf_id].role_loss(
-            role="leaf", **trainers[leaf_id].prepare_batch(selected),
+        leaf_batch = trainers[leaf_id].prepare_batch(selected)
+        leaf_loss, leaf_block, leaf_rel, leaf_irrel = nodes[leaf_id].role_loss(
+            role="leaf", return_breakdown=True, **leaf_batch,
         )
-        relay_loss, relay_block = nodes[relay_id].role_loss(
+        relay_batch = trainers[relay_id].prepare_batch(selected)
+        relay_loss, relay_block, relay_rel, relay_irrel = nodes[relay_id].role_loss(
             role="relay", incoming=(detach_kv_block(leaf_block),),
-            **trainers[relay_id].prepare_batch(selected),
+            child_relevant=leaf_batch["local_relevant"],
+            return_breakdown=True, **relay_batch,
         )
         leaf_losses.append(leaf_loss)
         relay_losses.append(relay_loss)
+        leaf_relevant_losses.append(leaf_rel)
+        leaf_irrelevant_losses.append(leaf_irrel)
+        relay_relevant_losses.append(relay_rel)
+        relay_irrelevant_losses.append(relay_irrel)
         leaf_blocks.append(detach_kv_block(leaf_block))
         relay_blocks.append(detach_kv_block(relay_block))
     source_loss, _ = nodes[source_id].role_loss(
@@ -701,7 +757,9 @@ def canonical_two_hop_losses_batch(
         "route": build_two_hop_route(graph, source_id),
         "leaf_blocks": tuple(leaf_blocks), "relay_blocks": tuple(relay_blocks),
         "leaf_loss": leaf_loss, "relay_loss": relay_loss, "source_loss": source_loss,
-        "total_loss": lambda_leaf * leaf_loss + lambda_relay * relay_loss + lambda_src * source_loss,
+        "leaf_relevant_loss": torch.stack(leaf_relevant_losses).mean(), "leaf_irrelevant_loss": torch.stack(leaf_irrelevant_losses).mean(),
+        "relay_relevant_loss": torch.stack(relay_relevant_losses).mean(), "relay_irrelevant_loss": torch.stack(relay_irrelevant_losses).mean(),
+        "total_loss": lambda_leaf * leaf_loss + lambda_relay * relay_loss,
     }
 
 
@@ -751,6 +809,10 @@ def synchronous_decentralized_accumulation(
             "leaf_loss": result["leaf_loss"].detach(),
             "relay_loss": result["relay_loss"].detach(),
             "source_loss": result["source_loss"].detach(),
+            "leaf_relevant_loss": result["leaf_relevant_loss"].detach(),
+            "leaf_irrelevant_loss": result["leaf_irrelevant_loss"].detach(),
+            "relay_relevant_loss": result["relay_relevant_loss"].detach(),
+            "relay_irrelevant_loss": result["relay_irrelevant_loss"].detach(),
             "total_loss": result["total_loss"].detach(),
         })
     after_forward = _node_parameter_snapshots(nodes, graph)
@@ -767,9 +829,13 @@ def synchronous_decentralized_accumulation(
         node.optimizer.step()
     return {
         "total_loss": total_loss,
-        "leaf_loss": sum(result["leaf_loss"].detach() * len(result["episodes"]) for result in results) / len(selected),
+        "leaf_loss": sum(result["leaf_loss"] * len(result["episodes"]) for result in results) / len(selected),
         "relay_loss": sum(result["relay_loss"].detach() * len(result["episodes"]) for result in results) / len(selected),
         "source_loss": sum(result["source_loss"].detach() * len(result["episodes"]) for result in results) / len(selected),
+        "leaf_relevant_loss": sum(result["leaf_relevant_loss"] * len(result["episodes"]) for result in results) / len(selected),
+        "leaf_irrelevant_loss": sum(result["leaf_irrelevant_loss"] * len(result["episodes"]) for result in results) / len(selected),
+        "relay_relevant_loss": sum(result["relay_relevant_loss"] * len(result["episodes"]) for result in results) / len(selected),
+        "relay_irrelevant_loss": sum(result["relay_irrelevant_loss"] * len(result["episodes"]) for result in results) / len(selected),
         "episodes": selected,
         "results": tuple(results),
     }
@@ -1287,7 +1353,10 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
             if by_source[source]:
                 batches.append(tuple(by_source[source][:batch_size]))
                 del by_source[source][:batch_size]
-    total_steps = math.ceil(len(scheduled) / effective_batch_size)
+    # A physical batch is source-local.  Its count is therefore
+    # sum_source ceil(n_source / batch_size), then accumulation combines
+    # consecutive physical batches into optimizer updates.
+    total_steps = math.ceil(len(batches) / accumulation_steps)
     hidden_size = int(model.config.hidden_size)
     dtype = model.get_input_embeddings().weight.dtype
     from .medical import load_hospital_private_stores
@@ -1323,7 +1392,7 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
     gossip_rounds = 0
     mixing_weights = metropolis_mixing_weights(graph)
     role_counts = {node_id: {role: 0 for role in ("leaf", "relay", "source")} for node_id in nodes}
-    role_loss_ema = {node_id: {role: None for role in ("leaf", "relay", "source")} for node_id in nodes}
+    loss_history: list[dict[str, float | int]] = []
     log_interval = max(1, sync_interval)
     print(
         f"decentralized train: episodes={total_episodes} updates={total_steps} "
@@ -1338,21 +1407,23 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
             micro_batches=batches[start:start + accumulation_steps],
         )
         for episode_result in result["results"]:
-            role_values = {
-                "leaf": float(episode_result["leaf_loss"].cpu()),
-                "relay": float(episode_result["relay_loss"].cpu()),
-                "source": float(episode_result["source_loss"].cpu()),
-            }
             for episode in episode_result["episodes"]:
                 for leaf_id, relay_id in graph_two_hop_branches(graph, episode.source_id):
                     for node_id, role in ((leaf_id, "leaf"), (relay_id, "relay")):
                         role_counts[node_id][role] += 1
-                        previous = role_loss_ema[node_id][role]
-                        role_loss_ema[node_id][role] = role_values[role] if previous is None else 0.9 * previous + 0.1 * role_values[role]
                 role_counts[episode.source_id]["source"] += 1
-                previous = role_loss_ema[episode.source_id]["source"]
-                role_loss_ema[episode.source_id]["source"] = role_values["source"] if previous is None else 0.9 * previous + 0.1 * role_values["source"]
-        losses.append(float(result["total_loss"]))
+        batch_losses = {
+            "leaf": float(result["leaf_loss"]),
+            "relay": float(result["relay_loss"]),
+            "source": float(result["source_loss"]),
+            "total": float(result["total_loss"]),
+            "leaf_relevant": float(result["leaf_relevant_loss"]),
+            "leaf_irrelevant": float(result["leaf_irrelevant_loss"]),
+            "relay_relevant": float(result["relay_relevant_loss"]),
+            "relay_irrelevant": float(result["relay_irrelevant_loss"]),
+        }
+        losses.append(batch_losses["total"])
+        loss_history.append({"step": step, **batch_losses})
         if step % sync_interval == 0:
             mixing_weights = gossip_node_interfaces(nodes, graph, mixing_weights=mixing_weights)
             gossip_rounds += 1
@@ -1360,7 +1431,9 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
             gossip_note = f" gossip_round={gossip_rounds}" if step % sync_interval == 0 else ""
             print(
                 f"decentralized train: step={step}/{total_steps} "
-                f"loss={losses[-1]:.4f} elapsed={time.perf_counter() - start_time:.1f}s{gossip_note}",
+                f"leaf_loss={batch_losses['leaf']:.4f} relay_loss={batch_losses['relay']:.4f} "
+                f"source_loss={batch_losses['source']:.4f} total_loss={batch_losses['total']:.4f} "
+                f"elapsed={time.perf_counter() - start_time:.1f}s{gossip_note}",
                 flush=True,
             )
     elapsed_seconds = time.perf_counter() - start_time
@@ -1380,10 +1453,13 @@ def _train_decentralized_nodes(*, model: torch.nn.Module, model_name: str, token
                   "total_steps": total_steps,
                   "sync_interval": sync_interval, "seed": seed, "updates": len(losses),
                   "role_loss_weights": {"leaf": 0.5, "relay": 0.5, "source": 1.0},
-                  "role_counts": role_counts, "role_loss_ema": role_loss_ema,
+                  "role_counts": role_counts, "loss_history": loss_history,
                   "parameter_drift": _interface_parameter_drift(nodes, initial_interfaces, graph),
                   "last_loss": losses[-1] if losses else float("nan"),
                   "elapsed_seconds": elapsed_seconds},
+    )
+    (output / "loss_history.json").write_text(
+        json.dumps(loss_history, indent=2) + "\n", encoding="utf-8",
     )
     return {"updates": float(len(losses)), "last_loss": losses[-1] if losses else float("nan"),
             "elapsed_seconds": elapsed_seconds, "peak_memory_bytes": 0.0,

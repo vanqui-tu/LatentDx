@@ -179,6 +179,7 @@ def build_agent_prompt_batch(
             "host_question_ids": _tokenize(tokenizer, host_text, max_prompt_length),
             "public_query_ids": _tokenize(tokenizer, host_text, max_prompt_length),
             "target_ids": target,
+            "local_relevant": prediction_matches_target(result.label, episode),
         })
     return tuple(rows)
 

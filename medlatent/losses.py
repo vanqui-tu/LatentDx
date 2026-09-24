@@ -12,6 +12,7 @@ def diagnosis_cross_entropy(
     target_labels: torch.Tensor,
     *,
     ignore_index: int = -100,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """Compute CE including the first answer token.
 
@@ -29,4 +30,14 @@ def diagnosis_cross_entropy(
     shifted_labels = target_labels[:, 1:]
     logits = torch.cat([first_token_logits.unsqueeze(1), shifted_logits], dim=1)
     labels = torch.cat([first_labels, shifted_labels], dim=1)
-    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1), ignore_index=ignore_index)
+    if reduction not in {"none", "mean", "sum"}:
+        raise ValueError("reduction must be 'none', 'mean', or 'sum'")
+    token_loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]), labels.reshape(-1),
+        ignore_index=ignore_index, reduction="none",
+    ).reshape(labels.shape)
+    valid = labels != ignore_index
+    per_example = token_loss.sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+    if reduction == "none":
+        return per_example
+    return per_example.mean() if reduction == "mean" else per_example.sum()

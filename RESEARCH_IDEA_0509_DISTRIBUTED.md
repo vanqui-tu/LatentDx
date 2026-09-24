@@ -739,34 +739,43 @@ fan-out `k`.
 
 #### 13.3 Training objective
 
-The purpose of training is twofold: every node must produce a useful message
-from local evidence, and every relay must preserve useful information while
-aggregating a child message. Therefore train the two modes with explicit
-role-balanced losses, not one ambiguous mean over all nodes:
+Do not force every node to predict the gold label. That would teach a hospital
+with irrelevant retrieval to hallucinate label information. For the first M4
+implementation, define `relevant_i=1` only when node `i`'s local top-1 retrieved
+label matches the gold label or a declared alias. This is a training proxy, not
+a claim that retrieval relevance is perfectly observed.
+
+Use three simple task-space losses. Let `CE(B)` be diagnosis CE from the public
+query conditioned on block `B`, and `CE(empty)` the same loss without a block:
 
 ```text
-L_leaf  = CE(y | public_query, B_leaf)
-L_relay = CE(y | public_query, B_relay)
+leaf relevant:       L_leaf  = CE(B_leaf)
+leaf irrelevant:     L_leaf  = max(0, CE(B_leaf) - CE(empty))
+
+relay local relevant:L_relay = CE(B_relay)
+relay local irrelevant, child relevant:
+                     L_relay = max(0, CE(B_relay) - CE(B_child))
+relay and child irrelevant:
+                     L_relay = max(0, CE(B_relay) - CE(empty))
+
+L_train = 0.5 * mean(L_leaf) + 0.5 * mean(L_relay)
 L_src   = CE(y | x_s, [B_relay_0, B_relay_1])
-L_total = lambda_leaf * L_leaf
-        + lambda_relay * L_relay
-        + lambda_src * L_src
 ```
 
-`public_query` is the host question only; it contains no other agent's private
-retrieval. It gives leaf and relay blocks a source-independent answer-semantic
-target. `L_src` is the actual end-to-end objective and is computed only at the
-source using its private prompt and returned relay blocks. A source cannot use
-another node's private prompt to form a loss. The default weights are
-`lambda_leaf=lambda_relay=0.5` and `lambda_src=1.0`; keep them explicit in the
-checkpoint and ablate them later.
+`public_query` contains no private retrieval. The no-harm margin is zero for the
+initial implementation; do not add a learned NULL block or relevance model yet.
+`L_src` is the primary end-to-end training diagnostic and validation metric.
+Under the detached-edge M4 contract it does not backpropagate into leaf/relay
+nodes and is not added to `L_train`; each node's interface is updated when that
+node rotates through leaf and relay roles. A future source aggregator may use
+`L_src`, but it must also be present unchanged at evaluation.
 
 Each node must receive both local and relay examples over training. Rotate the
 source assignment and branch roles so every node is a leaf, relay, and source
 on comparable numbers of episodes. A node's local update may use only its own
-private prompt, public query, target, and detached received blocks. The source
-loss updates only the source replica; the leaf/relay losses provide the local
-credit needed to train message semantics without cross-node gradients.
+private prompt, public query, target, local relevance proxy, and detached
+received blocks. Log relevant and irrelevant losses separately; a mixed mean
+alone is not a convergence metric.
 
 #### 13.4 Synchronous optimizer and gossip semantics
 
@@ -1043,24 +1052,26 @@ canonical result existed. Do not complete those tasks under their old scope.
 
 ### 15.5 M4 - Decentralized latent-interface training
 
-- [x] **L4.1 - Canonical two-hop computation graph and role losses.** Replace
+- [x] **L4.1 - Canonical two-hop computation graph and relevance-aware losses.** Replace
   the current source-rooted training route with the single canonical return
   route `source <- relay <- leaf` defined in Section 13.1. Implement one shared
   route builder used by training and evaluation; reject routes without two
-  node-disjoint two-hop branches. Add explicit `L_leaf`, `L_relay`, and `L_src`
-  losses from Section 13.3, role rotation so every node trains all three roles,
+  node-disjoint two-hop branches. Add the relevant/no-harm/preserve losses from
+  Section 13.3 and role rotation so every node trains local and relay modes,
   node-local store ownership, detached child blocks, and a frozen backbone.
   **Files:** `medlatent/distributed/latent.py`,
   `medlatent/distributed/medical.py`, and focused unit tests. **Done when:** a
   CPU fixture proves that a leaf is trained in local mode, a relay receives the
   leaf block and re-encodes it, the source consumes only relay blocks, and all
-  sends follow graph edges. **DONE (2026-09-23; focused latent tests 18 passed).**
+  sends follow graph edges. Tests must cover relevant leaf, irrelevant leaf,
+  relevant child through an irrelevant relay, and both-irrelevant cases.
+  **DONE (2026-09-24; full suite 43 passed):** relevance-aware losses and persisted loss history implemented.
 - [x] **L4.2 - Synchronous decentralized optimizer and gossip.** Implement the
   snapshot algorithm in Section 13.4: forward all roles from `theta^t`, compute
   per-node gradients, apply optimizer steps atomically, then gossip atomically
   after `G` steps. Start with `G=1`, plain SGD, and symmetric Metropolis mixing;
   add `G=4,8,16` only as ablations. Shuffle/interleave source IDs before
-  batching. Checkpoint role counts, per-role losses/EMA, node states, gossip
+  batching. Checkpoint role counts and per-role loss history, node states, gossip
   rounds, mixing weights, and parameter drift. **Done when:** a test detects
   that no post-update block is consumed in the same step and gossip preserves
   graph locality, shape validity, and reproducibility. **DONE (2026-09-23;
@@ -1097,6 +1108,7 @@ notes rather than expanding this table indefinitely.
 
 | Date | Session/work | Tasks | Verification/evidence | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-24 | Make M4 losses relevance-aware | L4.1 | Documentation-only | Relevant nodes learn gold utility; irrelevant leaves learn no-harm; irrelevant relays preserve useful children; `L_src` is detached end-to-end validation |
 | 2026-09-22 | Reopen L4.1/L4.2 after architecture review | L4.1, L4.2 | Initial implementation had ID-ordered relay, source retrieval omission, central orchestration, and unsynchronized Adam state | Corrected path is graph-routed node-local training with source evidence, shared initialization, and SGD before re-verification |
 | 2026-09-22 | Correct graph-routed local training path | L4.1, L4.2 | `DecentralizedMAS`: focused latent tests (13 passed), full suite (39 passed); all shortcut-graph sources reach five nodes with fanout <= 2 | BFS parent tree, node-owned stores/trainers, source local evidence, shared initialization, and SGD are implemented; tasks remain open pending broader decentralized training validation |
 | 2026-09-22 | Try batched node-local queries | L4.1, L4.2 | `DecentralizedMAS`: full suite (40 passed); batched local/relay smoke passed | Batch episodes by source owner, cache detached child KV blocks, keep frozen backbone/no cross-node autograd, and gossip every sync interval; broader performance validation remains open |
@@ -1106,9 +1118,11 @@ notes rather than expanding this table indefinitely.
 | 2026-09-22 | Promote decentralized latent training to M4 | M4 planning | Documentation-only; M3 retained as centralized oracle and M4 defined as local replicas plus graph gossip | Keep local/relay modes, frozen backbone, fixed sparse graph, and no learned routing |
 | 2026-09-23 | Redesign M4 training/evaluation contract | L4.1-L4.3 | Documentation-only; canonical route is `source <- relay <- leaf`, with role-balanced losses, synchronous snapshots, and protocol-faithful evaluation | Replaces source-rooted relay training and leaf-to-source evaluation shortcuts; implementation must share one route builder |
 | 2026-09-23 | Implement canonical L4.1 route and role losses | L4.1 | `DecentralizedMAS`: focused latent/medical tests (18 passed) | Strict two-branch graph route, public-query leaf/relay losses, detached child blocks, source-only relay consumption, deterministic role interleaving |
-| 2026-09-23 | Implement L4.2 snapshot SGD and gossip | L4.2 | `DecentralizedMAS`: full suite (43 passed) | Atomic forward/gradient/update ordering, G-step Metropolis gossip, role counts/EMA and parameter drift checkpoint metadata |
+| 2026-09-23 | Implement L4.2 snapshot SGD and gossip | L4.2 | `DecentralizedMAS`: full suite (43 passed) | Atomic forward/gradient/update ordering, G-step Metropolis gossip, role counts and parameter drift checkpoint metadata |
 | 2026-09-23 | Add decentralized effective-batch accumulation | L4.2 | Latent focused tests passed; `batch_size` is now the micro-batch and `effective_batch_size` controls one update | Default gossip interval is `G=4`; larger `G` remains a CLI ablation |
 | 2026-09-23 | Vectorize decentralized route micro-batches | L4.2 | Latent focused tests (17 passed) | Same-source episodes share batched leaf/relay/source forwards; accumulation releases graphs after backward |
+| 2026-09-24 | Correct source loss and update accounting | L4.2 | Focused latent/medical tests (21 passed) | Source consumes relay blocks directly; physical batch count is `sum_source ceil(n_source / batch_size)` and logs include role/total losses |
+| 2026-09-24 | Implement relevance-aware M4 losses and loss history | L4.1/L4.2 | `DecentralizedMAS`: full suite (43 passed) | Relevant nodes use CE; irrelevant leaf/relay use no-harm/preserve hinge; `L_src` is diagnostic only; EMA removed and `loss_history.json` saved |
 | 2026-09-05/06 | M0/M1 and medical/text substrate | FOUNDATION | M1 verification note; distributed suite and CPU smoke passed | Foundation frozen |
 | 2026-09-07 | Evidence-distance and remote-necessity fixes | M205, M206 | Commit `bd5d825`; 56 tests passed | Preserve the corrected concepts/tests where relevant; modules may be removed |
 | 2026-09-07 | Generalized experiment layer | retired M207-M209 | Uncommitted working tree | Reviewed as excessive for the current question |
