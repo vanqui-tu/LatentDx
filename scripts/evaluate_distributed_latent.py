@@ -27,6 +27,7 @@ from medlatent.distributed import (  # noqa: E402
     prediction_matches_target,
     sample_balanced_sources,
     select_kv_rows,
+    kv_wire_bytes,
 )
 from medlatent.distributed.latent import _pilot_batch_tensors  # noqa: E402
 from medlatent.hf_data import MedLatentDiagnosisDataset  # noqa: E402
@@ -186,11 +187,34 @@ def _evaluate_method(*, method: str, protocol: DistributedLatentProtocol, tokeni
     return rows, total_seconds, peak
 
 
+def _build_untrained_protocol(model, payload, device, dtype):
+    hidden_size = int(model.config.hidden_size)
+    return DistributedLatentProtocol(
+        model, LatentDistiller(hidden_size).to(device=device, dtype=dtype),
+        BoundaryEmbeddings(hidden_size).to(device=device, dtype=dtype),
+        num_latents=int(payload["num_latents"]),
+    )
+
+
+def _validate_events(graph, source_id: int, events: list[dict[str, object]]) -> None:
+    if not events:
+        return
+    if any(not graph.has_edge(int(event["sender"]), int(event["receiver"])) for event in events):
+        raise ValueError("evaluation trace contains a non-edge send")
+    if any(int(event["round"]) == 2 and int(event["receiver"]) == source_id for event in events):
+        raise ValueError("evaluation trace contains a direct leaf-to-source send")
+    if max(int(event["round"]) for event in events) < 3:
+        raise ValueError("source prediction occurred before relay returns")
+    if any(not bool(event.get("reencoded", False)) for event in events if int(event["round"]) == 3):
+        raise ValueError("evaluation trace contains a relay without re-encoding")
+
+
 def _evaluate_decentralized_method(*, method: str, protocols: dict[int, DistributedLatentProtocol],
+                                   relay_controls: dict[int, DistributedLatentProtocol],
                                    tokenizer, episodes, rows_by_case, graph, batch_size: int,
                                    pad_token_id: int, max_new_tokens: int, device: torch.device,
                                    gold_agents: dict[str, set[int]]) -> tuple[list[dict[str, object]], float, int]:
-    """Evaluate per-node interfaces while preserving one fixed source route per batch."""
+    """Evaluate protocol-faithful per-node two-hop interfaces."""
     rows: list[dict[str, object]] = []
     total_seconds = 0.0
     if device.type == "cuda":
@@ -212,34 +236,47 @@ def _evaluate_decentralized_method(*, method: str, protocols: dict[int, Distribu
                           for event in build_two_hop_route(graph, batch[0].source_id)
                           if event["round"] == 2)
             routes = [route] * len(batch)
-            if method == "local_only":
+            events: list[dict[str, object]] = []
+            if method == "source_only":
                 branches = ()
                 messages = 0
-            elif method == "decentralized_local":
+            elif method in {"full_2hop", "leaf_ablation", "relay_ablation"}:
                 branches = []
-                messages = 2
+                active_branches = (0, 1) if method != "leaf_ablation" else (0,)
+                messages = 2 * len(active_branches)
                 for branch in (0, 1):
-                    leaf, _ = routes[0][branch]
-                    indices = list(range(branch, len(batch) * 2, 2))
-                    leaf_ids = tensors["leaf_ids"][indices]
-                    leaf_mask = tensors["leaf_mask"][indices]
-                    branches.append(protocols[leaf].rollout(leaf_ids, leaf_mask))
-            elif method == "decentralized_relay":
-                branches = []
-                messages = 4
-                for branch in (0, 1):
+                    if branch not in active_branches:
+                        continue
                     leaf, relay = routes[0][branch]
                     indices = list(range(branch, len(batch) * 2, 2))
                     leaf_block = protocols[leaf].rollout(
                         tensors["leaf_ids"][indices], tensors["leaf_mask"][indices],
                     )
-                    branches.append(protocols[relay].relay_rollout(
+                    relay_protocol = relay_controls[relay] if method == "relay_ablation" else protocols[relay]
+                    relay_block = relay_protocol.relay_rollout(
                         tensors["relay_ids"][indices], tensors["relay_mask"][indices],
                         [leaf_block], detach_children=True,
+                    )
+                    if relay_block[0][0].data_ptr() == leaf_block[0][0].data_ptr():
+                        raise ValueError("relay returned the leaf block without re-encoding")
+                    branches.append(relay_block)
+                    shape = list(relay_block[0][0].shape)
+                    wire_bytes = kv_wire_bytes(select_kv_rows(relay_block, 0))
+                    events.extend((
+                        {"round": 2, "sender": leaf, "receiver": relay, "kind": "PROPOSAL", "branch": branch,
+                         "block_shape": shape, "wire_bytes": wire_bytes},
+                        {"round": 3, "sender": relay, "receiver": batch[0].source_id, "kind": "PROPOSAL", "branch": branch,
+                         "block_shape": shape, "wire_bytes": wire_bytes, "reencoded": True},
                     ))
             else:
                 raise ValueError(f"unknown decentralized method: {method}")
+            _validate_events(graph, batch[0].source_id, events)
             source_protocol = protocols[batch[0].source_id]
+            source_loss = source_protocol.source_loss(
+                tensors["source_ids"], tensors["source_mask"],
+                tensors["target_ids"], tensors["target_labels"], tuple(branches),
+                reduction="none",
+            )
             generated = source_protocol.generate(
                 tensors["source_ids"], tensors["source_mask"], tuple(branches),
                 max_new_tokens=max_new_tokens, eos_token_id=tokenizer.eos_token_id,
@@ -266,12 +303,15 @@ def _evaluate_decentralized_method(*, method: str, protocols: dict[int, Distribu
                     "prediction": prediction,
                     "target": episode.target_label,
                     "correct": prediction_matches_target(prediction, episode),
+                    "source_loss": float(source_loss[index].detach().cpu()),
                     "evidence_stratum": stratum,
-                    "contacted_agent_ids": ([] if method == "local_only" else
+                    "contacted_agent_ids": ([] if method == "source_only" else
                                             sorted({node for route in routes[index] for node in route})),
                     "messages": messages,
                     "latent_bytes": latent_bytes,
                     "route": [list(route) for route in routes[index]],
+                    "events": events,
+                    "source_prediction_round": 4 if events else 0,
                     "latency_seconds": elapsed / max(1, len(batch)),
                 })
     peak = int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
@@ -323,8 +363,8 @@ def main() -> None:
                         nargs="+", default=None)
     parser.add_argument("--num_agents", type=int, default=None)
     parser.add_argument("--methods", nargs="+", default=None,
-                        choices=["local_only", "latent_local", "latent_relay",
-                                 "decentralized_local", "decentralized_relay"])
+                        choices=["source_only", "full_2hop", "leaf_ablation", "relay_ablation",
+                                 "local_only", "latent_local", "latent_relay"])
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--max_new_tokens", type=int, default=64)
@@ -348,20 +388,26 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
     decentralized = payload.get("module_type") == "DecentralizedLatentKV"
-    methods = args.methods or (["local_only", "decentralized_local", "decentralized_relay"]
+    methods = args.methods or (["source_only", "full_2hop", "leaf_ablation", "relay_ablation"]
                                if decentralized else ["local_only", "latent_local", "latent_relay"])
     if decentralized:
         protocols, tokenizer, payload, model_name = _load_decentralized_protocols(
             args.checkpoint, args.model_name, device, dtype, args.local_files_only,
         )
-        if any(method in {"latent_local", "latent_relay"} for method in methods):
-            parser.error("use decentralized_local/decentralized_relay for a decentralized checkpoint")
+        relay_controls = {
+            node_id: _build_untrained_protocol(
+                protocols[node_id].model, payload, device, dtype,
+            ) for node_id in protocols
+        }
+        if any(method in {"local_only", "latent_local", "latent_relay"} for method in methods):
+            parser.error("use source_only/full_2hop/leaf_ablation/relay_ablation for a decentralized checkpoint")
     else:
         protocol, tokenizer, payload, model_name = _load_protocol(
             args.checkpoint, args.model_name, device, dtype, args.local_files_only,
         )
-        if any(method.startswith("decentralized_") for method in methods):
-            parser.error("decentralized_* methods require a DecentralizedLatentKV checkpoint")
+        if any(method in {"source_only", "full_2hop", "leaf_ablation", "relay_ablation"}
+               for method in methods):
+            parser.error("decentralized methods require a DecentralizedLatentKV checkpoint")
     dataset = MedLatentDiagnosisDataset(
         data_file=args.query_file, hospital_dir=args.hospital_dir, tokenizer=tokenizer,
         num_hospitals=num_agents, hospital_ids=list(selected_ids),
@@ -407,7 +453,8 @@ def main() -> None:
     for method in methods:
         if decentralized:
             method_rows, elapsed, method_peak = _evaluate_decentralized_method(
-                method=method, protocols=protocols, tokenizer=tokenizer, episodes=episodes,
+                method=method, protocols=protocols, relay_controls=relay_controls,
+                tokenizer=tokenizer, episodes=episodes,
                 rows_by_case=rows_by_case, graph=graph, batch_size=args.batch_size,
                 pad_token_id=tokenizer.pad_token_id, max_new_tokens=args.max_new_tokens,
                 device=device, gold_agents=gold_agents,
@@ -423,6 +470,8 @@ def main() -> None:
         count = len(method_rows)
         summaries[method] = {
             "accuracy": sum(bool(row["correct"]) for row in method_rows) / count if count else 0.0,
+            "source_loss": (sum(float(row.get("source_loss", 0.0)) for row in method_rows) / count
+                            if count else 0.0),
             "mean_messages": sum(int(row["messages"]) for row in method_rows) / count if count else 0.0,
             "mean_latent_bytes": sum(int(row["latent_bytes"]) for row in method_rows) / count if count else 0.0,
             "mean_latency_seconds": elapsed / count if count else 0.0,

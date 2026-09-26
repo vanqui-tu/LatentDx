@@ -1076,7 +1076,7 @@ canonical result existed. Do not complete those tasks under their old scope.
   that no post-update block is consumed in the same step and gossip preserves
   graph locality, shape validity, and reproducibility. **DONE (2026-09-23;
   focused latent tests 17 passed).**
-- [ ] **L4.3 - Protocol-faithful decentralized evaluation.** Rewrite
+- [x] **L4.3 - Protocol-faithful decentralized evaluation.** Rewrite
   `scripts/evaluate_distributed_latent.py` to load per-node replicas and reuse
   the L4.1 route/forward function. The primary method is `full_2hop` only:
   `leaf -> relay -> source`; do not expose a leaf-to-source shortcut as a
@@ -1087,7 +1087,8 @@ canonical result existed. Do not complete those tasks under their old scope.
   then role losses, per-node/per-role utility, evidence strata, bytes/messages,
   latency, memory, drift, and consensus. **Done when:** matched q4r6 runs
   compare `full_2hop` with source-only, M3 oracle, and independent-local
-  controls and separate synchronization cost from inference cost.
+  controls and separate synchronization cost from inference cost. **IMPLEMENTED
+  (2026-09-26; CPU trace/compile validation; matched GPU utility run pending).**
 
 ### 15.6 Later work, not active tasks
 
@@ -1123,6 +1124,7 @@ notes rather than expanding this table indefinitely.
 | 2026-09-23 | Vectorize decentralized route micro-batches | L4.2 | Latent focused tests (17 passed) | Same-source episodes share batched leaf/relay/source forwards; accumulation releases graphs after backward |
 | 2026-09-24 | Correct source loss and update accounting | L4.2 | Focused latent/medical tests (21 passed) | Source consumes relay blocks directly; physical batch count is `sum_source ceil(n_source / batch_size)` and logs include role/total losses |
 | 2026-09-24 | Implement relevance-aware M4 losses and loss history | L4.1/L4.2 | `DecentralizedMAS`: full suite (43 passed) | Relevant nodes use CE; irrelevant leaf/relay use no-harm/preserve hinge; `L_src` is diagnostic only; EMA removed and `loss_history.json` saved |
+| 2026-09-26 | Implement protocol-faithful L4.3 evaluator | L4.3 | Evaluator compile, trace validation smoke, full suite (43 passed) | Methods are `source_only`, `full_2hop`, `leaf_ablation`, `relay_ablation`; direct leaf-to-source and missing relay re-encoding are rejected; GPU utility run pending |
 | 2026-09-05/06 | M0/M1 and medical/text substrate | FOUNDATION | M1 verification note; distributed suite and CPU smoke passed | Foundation frozen |
 | 2026-09-07 | Evidence-distance and remote-necessity fixes | M205, M206 | Commit `bd5d825`; 56 tests passed | Preserve the corrected concepts/tests where relevant; modules may be removed |
 | 2026-09-07 | Generalized experiment layer | retired M207-M209 | Uncommitted working tree | Reviewed as excessive for the current question |
