@@ -20,6 +20,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from medlatent.distributed import (  # noqa: E402
+    CommunicationGraph,
     MedicalBaselineKind,
     TransformersTextGenerator,
     VllmTextGenerator,
@@ -32,6 +33,7 @@ from medlatent.distributed import (  # noqa: E402
     ring_graph,
     run_medical_baseline,
     sample_balanced_sources,
+    shortcut_ring_graph,
 )
 
 
@@ -49,7 +51,23 @@ def main() -> int:
     parser.add_argument("--max_samples", type=int)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_agents", type=int, default=5)
-    parser.add_argument("--topology", choices=("ring", "complete", "path"), default="ring")
+    parser.add_argument(
+        "--topology",
+        choices=("ring", "shortcut_ring", "shortcut-ring", "complete", "path"),
+        default="ring",
+        help="Generated topology. Ignored when --topology_file is supplied.",
+    )
+    parser.add_argument(
+        "--topology_file",
+        type=Path,
+        help="Existing JSON summary or run manifest containing graph_edges or edge_list.",
+    )
+    parser.add_argument(
+        "--num_shortcuts",
+        type=int,
+        default=1,
+        help="Number of seeded non-ring edges for --topology shortcut_ring (default: 1).",
+    )
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--max_fanout", type=int, default=2)
     parser.add_argument("--max_text_tokens", type=int, default=128)
@@ -64,7 +82,10 @@ def main() -> int:
     _seed_everything(args.seed, deterministic=args.deterministic)
     methods = tuple(MedicalBaselineKind(value) for value in args.methods)
 
-    graph = {"ring": ring_graph, "complete": complete_graph, "path": path_graph}[args.topology](args.num_agents)
+    try:
+        graph = _build_graph(args)
+    except ValueError as error:
+        parser.error(str(error))
     stores = load_hospital_private_stores(
         args.hospital_dir,
         num_agents=args.num_agents,
@@ -130,10 +151,71 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     for name in ("num_agents", "rounds", "max_fanout", "max_text_tokens", "max_text_wire_bytes", "max_new_tokens"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name} must be positive")
+    if args.num_shortcuts < 0:
+        parser.error("--num_shortcuts must be non-negative")
     if args.max_samples is not None and args.max_samples <= 0:
         parser.error("--max_samples must be positive")
     if args.seed < 0:
         parser.error("--seed must be non-negative")
+
+
+def _build_graph(args: argparse.Namespace) -> CommunicationGraph:
+    """Use an explicit saved graph when available, otherwise generate one."""
+    if args.topology_file is not None:
+        return _load_graph_from_file(args.topology_file, args.num_agents)
+    if args.topology in {"shortcut_ring", "shortcut-ring"}:
+        return shortcut_ring_graph(
+            args.num_agents,
+            seed=args.seed,
+            num_shortcuts=args.num_shortcuts,
+        )
+    return {"ring": ring_graph, "complete": complete_graph, "path": path_graph}[args.topology](args.num_agents)
+
+
+def _load_graph_from_file(path: Path, num_agents: int) -> CommunicationGraph:
+    """Restore an undirected graph recorded by a latent summary or baseline manifest."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"could not read topology file: {path}") from error
+    except json.JSONDecodeError as error:
+        raise ValueError(f"topology file is not valid JSON: {path}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("topology file must contain a JSON object")
+
+    recorded_agents = payload.get("num_agents")
+    if recorded_agents is not None and (
+        isinstance(recorded_agents, bool)
+        or not isinstance(recorded_agents, int)
+        or recorded_agents != num_agents
+    ):
+        raise ValueError(
+            f"topology file num_agents={recorded_agents!r} does not match --num_agents={num_agents}"
+        )
+    if "graph_edges" in payload:
+        raw_edges = payload["graph_edges"]
+    elif "edge_list" in payload:
+        raw_edges = payload["edge_list"]
+    else:
+        raise ValueError("topology file must contain graph_edges or edge_list")
+    if not isinstance(raw_edges, list):
+        raise ValueError("topology edges must be a JSON array")
+
+    adjacency = np.zeros((num_agents, num_agents), dtype=np.bool_)
+    for raw_edge in raw_edges:
+        if (
+            not isinstance(raw_edge, list)
+            or len(raw_edge) != 2
+            or any(isinstance(node, bool) or not isinstance(node, int) for node in raw_edge)
+        ):
+            raise ValueError("each topology edge must be a two-element integer array")
+        left, right = raw_edge
+        if not 0 <= left < num_agents or not 0 <= right < num_agents:
+            raise ValueError(f"topology edge has node outside [0, {num_agents}): {raw_edge!r}")
+        if adjacency[left, right] or adjacency[right, left]:
+            raise ValueError(f"topology file contains duplicate edge: {raw_edge!r}")
+        adjacency[left, right] = adjacency[right, left] = True
+    return CommunicationGraph(adjacency)
 
 
 def _seed_everything(seed: int, *, deterministic: bool) -> None:
@@ -203,7 +285,10 @@ def _manifest(args: argparse.Namespace, graph) -> dict[str, object]:
         "seed": args.seed,
         "deterministic": args.deterministic,
         "num_agents": args.num_agents,
-        "topology": args.topology,
+        "topology": "file" if args.topology_file is not None else args.topology.replace("-", "_"),
+        "topology_file": str(args.topology_file) if args.topology_file is not None else None,
+        "topology_file_sha256": _sha256(args.topology_file) if args.topology_file is not None else None,
+        "num_shortcuts": args.num_shortcuts if args.topology_file is None else None,
         "edge_list": [list(edge) for edge in graph.edge_list()],
         "rounds": args.rounds,
         "max_fanout": args.max_fanout,
