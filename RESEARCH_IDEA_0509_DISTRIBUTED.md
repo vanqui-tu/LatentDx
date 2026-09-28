@@ -1,6 +1,6 @@
 # Distributed Communication for Private-Knowledge Diagnosis
 
-> Working research and implementation plan. Last updated: 2026-09-22.
+> Working research and implementation plan. Last updated: 2026-09-28.
 >
 > Current scope: Phase 1 supports fixed, simple, undirected graphs only.
 > Directed graphs, dynamic topology, node churn, and network failures are
@@ -69,6 +69,10 @@ a request to a one-hop neighbor followed by its reply requires at least two
 rounds. Under request-return routing, evidence at distance `d` cannot influence
 the source in fewer than `2d` rounds.
 
+The active structured/text medical baseline uses a simpler tree protocol: `R`
+bounds query depth, then replies aggregate bottom-up outside that depth budget.
+This scoped baseline rule does not change the M3/M4 latent route contract.
+
 ### 2.1 Privacy boundary for the MVP
 
 Raw store items never leave their owner. Baseline messages may contain derived
@@ -133,12 +137,11 @@ Initialization should reject:
 - sends to a non-neighbor or fan-out above `k`.
 
 The fundamental feasibility condition is more specific than connectivity. If
-`I*(q)` is the set of evidence-bearing agents, the graph and round budget must
-permit evidence to influence the source. In the initial request-return
-protocol, an evidence-bearing agent at shortest-path distance `d` requires at
-least `2d` rounds, before accounting for fan-out and routing failures.
-The `R=2` versus `R=4` ring comparison is sufficient to expose out-of-budget
-two-hop evidence in M2; no general connectivity policy is needed.
+`I*(q)` is the set of evidence-bearing agents, the graph and query-depth budget
+must permit a claimed tree path from the source. In the medical tree baseline,
+an agent at distance `d` requires `R >= d`; replies aggregate after expansion.
+The `R=2` versus `R=4` ring comparison is sufficient to expose deeper evidence
+in M2; no general connectivity policy is needed.
 
 ## 5. Message and Channel Contract
 
@@ -210,12 +213,12 @@ Because the graph is undirected, a consulted neighbor may reply over the same
 edge in the following round. Request and reply remain two distinct sends and
 both count toward their respective sender's per-round budget.
 
-### B2. Multi-hop flooding with deduplication
+### B2. Multi-hop random tree
 
-Forward a request to up to `k` unvisited neighbors until TTL/round budget
-expires. The first-arrival parent tree supplies the return path for
-evidence/proposals. This baseline tests reachability and aggregation without
-learned routing.
+Select up to `k` unclaimed neighbors uniformly at each query depth. Each node
+waits for all child replies, aggregates them with local evidence, and sends one
+new reply to its parent. This baseline tests reachability and aggregation
+without learned routing.
 
 ### B3. Random-`k` / random-walk routing
 
@@ -361,17 +364,19 @@ N: 5
 hospital-to-node mapping: identity
 source assignment: existing balanced assignment, seed 42
 graph: ring
-R: 4
+R: 4 request hops
 k: 2
-router: flood-unvisited
+router: seeded random query tree; each node is claimed once per episode
 retrieval: current HPO top-1
 aggregation: current mean-score rule
 ```
 
-On a five-node ring, every node is at most two hops away, and `R=4` permits a
-request-return path from the farthest node. This is the smallest setting that
-actually exercises sparse multi-hop communication without adding arbitrary
-graph choices.
+The source selects up to `k` unclaimed neighbors uniformly. Each receiver
+excludes its parent, selects up to `k` unclaimed neighbors, waits for all child
+replies, aggregates local and child evidence, and sends one reply to its
+parent. `R` limits only request depth; replies return after expansion and are
+not forwarded raw. This is the smallest setting that actually exercises sparse
+multi-hop communication without adding arbitrary graph choices.
 
 Run only these comparisons:
 
@@ -397,14 +402,14 @@ Write one plain JSONL row per `(case, method)` with only:
 
 ```text
 case_id, source_id, method, prediction, target,
-contacted_agent_ids, messages, wire_bytes
+messages, wire_bytes
 ```
 
-Write one summary JSON containing per-method accuracy, mean messages, and mean
-bytes. A direct retrieval scan in the runner should also report three dataset
-facts once: fraction with a source-local gold hit, fraction with a remote gold
-hit, and fraction with no gold hit anywhere. These are diagnostics, not another
-audit abstraction.
+Write one summary JSON containing per-method accuracy, mean messages, bytes,
+and agents reached. A direct retrieval scan in the runner should also report
+three dataset facts once: fraction with a source-local gold hit, fraction with
+a remote gold hit, and fraction with no gold hit anywhere. These are
+diagnostics, not another audit abstraction.
 
 No alias registry, bootstrap utility, config hash, comparison ID, graph hash,
 hospital permutation, per-agent cost table, or five-way seed object is required
@@ -435,6 +440,9 @@ B0, stop and redesign the data/task partition. More routers, graph types, and
 result schemas will not repair a task that does not require collaboration.
 
 ### 8.5 One 10-hospital robustness check
+
+The archived results below use the superseded flood router and are historical
+only. Rerun them before comparing against the tree-aggregation protocol.
 
 Structured results on all 401 cases:
 
@@ -626,8 +634,8 @@ privacy adversaries, or a generalized latent registry in M3.
 - a three-node path requires two hops to reach the evidence node;
 - B0 fails and B2 succeeds on a constructed complementary-evidence example;
 - reducing `R` or deleting the bridge edge removes that success;
-- a distance-`d` evidence node cannot inform the source when `R < 2d` under
-  request-return routing;
+- a distance-`d` medical-tree evidence node cannot inform the source when
+  `R < d`;
 - the five-node ring produces B0/B1/B2 predictions and costs; and
 - a fake text generator exercises the same route without loading a model.
 - an M4 episode emits only `s -> relay -> leaf` requests and

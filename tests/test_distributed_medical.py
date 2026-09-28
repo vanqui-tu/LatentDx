@@ -1,8 +1,10 @@
 import json
 from pathlib import Path
 
+import numpy as np
+
 from medlatent.distributed import (
-    MedicalBaselineKind, MedicalEpisode, MedicalQuery, build_medical_agents,
+    CommunicationGraph, MedicalBaselineKind, MedicalEpisode, MedicalQuery, build_medical_agents,
     TextGeneration, build_agent_retrieval_batch, load_hospital_private_stores, path_graph, prediction_matches_target, run_medical_baseline,
 )
 
@@ -36,7 +38,7 @@ def test_b2_returns_two_hop_private_evidence_to_source(tmp_path):
     assert local.prediction is None
     assert one_hop.prediction is None
     assert flood.prediction == "Target"
-    assert flood.contacted_agent_ids == (0, 1, 2)
+    assert flood.agents_reached == 3
     assert flood.wire_bytes > 0
 
 
@@ -61,6 +63,68 @@ def test_text_baseline_uses_same_route_and_fake_aggregation(tmp_path):
     assert result.prediction == "Disease 0"
     assert result.text_tokens > 0
     assert result.text_prompt_tokens > 0
+
+
+def test_b2_rounds_bound_request_depth_and_aggregate_replies_up_the_tree(tmp_path):
+    hospitals = tmp_path / "hospitals"
+    hospitals.mkdir()
+    for index in range(5):
+        _write(hospitals / f"hospital_{index}.json", [_row(f"h{index}", "HP:1", f"Disease {index}")])
+    embeddings, ic = tmp_path / "embeddings.json", tmp_path / "ic.json"
+    _write(embeddings, {"HP:1": [1.0]})
+    _write(ic, {"HP:1": 1.0})
+    agents = build_medical_agents(load_hospital_private_stores(
+        hospitals, num_agents=5, hpo_embeddings_file=embeddings, hpo_ic_file=ic,
+    ))
+    episode = MedicalEpisode("test", MedicalQuery("query", ("HP:1",), "phenotype"), "Disease 4", 0)
+
+    result = run_medical_baseline(
+        episode, path_graph(5), agents, MedicalBaselineKind.FLOODING,
+        max_rounds=4, max_fanout=1, seed=42,
+    )
+
+    assert result.agents_reached == 5
+    sent = [(event.agent_id, event.receiver_id, event.message_id) for event in result.episode.events]
+    assert all((left, right) in {(0, 1), (1, 2), (2, 3), (3, 4), (4, 3), (3, 2), (2, 1), (1, 0)}
+               for left, right, _ in sent)
+    assert not any(left == 4 and right == 0 for left, right, _ in sent)
+
+
+def test_b2_claims_a_shared_child_once_per_query(tmp_path):
+    hospitals = tmp_path / "hospitals"
+    hospitals.mkdir()
+    for index in range(4):
+        _write(hospitals / f"hospital_{index}.json", [_row(f"h{index}", "HP:1", f"Disease {index}")])
+    embeddings, ic = tmp_path / "embeddings.json", tmp_path / "ic.json"
+    _write(embeddings, {"HP:1": [1.0]})
+    _write(ic, {"HP:1": 1.0})
+    agents = build_medical_agents(load_hospital_private_stores(
+        hospitals, num_agents=4, hpo_embeddings_file=embeddings, hpo_ic_file=ic,
+    ))
+    graph = CommunicationGraph(np.array([
+        [0, 1, 1, 0],
+        [1, 0, 0, 1],
+        [1, 0, 0, 1],
+        [0, 1, 1, 0],
+    ]))
+    episode = MedicalEpisode("test", MedicalQuery("query", ("HP:1",), "phenotype"), "Disease 3", 0)
+
+    result = run_medical_baseline(
+        episode, graph, agents, MedicalBaselineKind.FLOODING,
+        max_rounds=2, max_fanout=2, seed=42,
+    )
+    text_result = run_medical_baseline(
+        episode, graph, agents, MedicalBaselineKind.FLOODING,
+        max_rounds=2, max_fanout=2, channel="text", seed=42,
+    )
+
+    requests_to_shared_node = [
+        event for event in result.episode.events
+        if event.receiver_id == 3 and event.message_id is not None and ":request:" in event.message_id
+    ]
+    assert result.agents_reached == 4
+    assert text_result.agents_reached == result.agents_reached
+    assert len(requests_to_shared_node) == 1
 
 
 def test_target_aliases_make_evaluation_language_and_format_insensitive():

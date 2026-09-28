@@ -108,6 +108,7 @@ def main() -> int:
     )
 
     rows: list[dict[str, object]] = []
+    reach_counts = {kind.value: [] for kind in methods}
     for episode in episodes:
         for kind in methods:
             result = run_medical_baseline(
@@ -122,6 +123,7 @@ def main() -> int:
                 max_text_wire_bytes=args.max_text_wire_bytes,
                 text_generator=generator,
                 max_text_completion_tokens=args.max_new_tokens,
+                seed=args.seed,
             )
             rows.append({
                 "case_id": episode.query.case_id,
@@ -129,14 +131,14 @@ def main() -> int:
                 "method": kind.value,
                 "prediction": result.prediction,
                 "target": episode.target_label,
-                "contacted_agent_ids": list(result.contacted_agent_ids),
                 "messages": sum(event.event_type == "sent" for event in result.episode.events),
                 "wire_bytes": result.wire_bytes,
             })
+            reach_counts[kind.value].append(result.agents_reached)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     _write_jsonl(args.output_dir / "episodes.jsonl", rows)
-    summary = _summary(rows, episodes, stores, methods, graph)
+    summary = _summary(rows, episodes, stores, methods, graph, reach_counts)
     _write_json(args.output_dir / "summary.json", summary)
     _write_json(args.output_dir / "run.json", _manifest(args, graph))
     print(json.dumps(summary, sort_keys=True))
@@ -241,6 +243,7 @@ def _summary(
     stores: dict,
     methods: tuple[MedicalBaselineKind, ...],
     graph: CommunicationGraph,
+    reach_counts: dict[str, list[int]] | None = None,
 ) -> dict[str, object]:
     episode_by_case_id = {episode.query.case_id: episode for episode in episodes}
     method_summary: dict[str, dict[str, float]] = {}
@@ -251,6 +254,7 @@ def _summary(
             "accuracy": sum(prediction_matches_target(row["prediction"], episode_by_case_id[row["case_id"]]) for row in method_rows) / count,
             "mean_messages": sum(int(row["messages"]) for row in method_rows) / count,
             "mean_bytes": sum(int(row["wire_bytes"]) for row in method_rows) / count,
+            "mean_agents_reached": sum((reach_counts or {}).get(method, ())) / count,
         }
     return {
         "num_agents": graph.num_agents,
