@@ -136,7 +136,7 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     _write_jsonl(args.output_dir / "episodes.jsonl", rows)
-    summary = _summary(rows, episodes, stores, methods)
+    summary = _summary(rows, episodes, stores, methods, graph)
     _write_json(args.output_dir / "summary.json", summary)
     _write_json(args.output_dir / "run.json", _manifest(args, graph))
     print(json.dumps(summary, sort_keys=True))
@@ -235,7 +235,13 @@ def _seed_everything(seed: int, *, deterministic: bool) -> None:
         pass
 
 
-def _summary(rows: list[dict[str, object]], episodes: tuple, stores: dict, methods: tuple[MedicalBaselineKind, ...]) -> dict[str, object]:
+def _summary(
+    rows: list[dict[str, object]],
+    episodes: tuple,
+    stores: dict,
+    methods: tuple[MedicalBaselineKind, ...],
+    graph: CommunicationGraph,
+) -> dict[str, object]:
     episode_by_case_id = {episode.query.case_id: episode for episode in episodes}
     method_summary: dict[str, dict[str, float]] = {}
     for method in (kind.value for kind in methods):
@@ -247,6 +253,8 @@ def _summary(rows: list[dict[str, object]], episodes: tuple, stores: dict, metho
             "mean_bytes": sum(int(row["wire_bytes"]) for row in method_rows) / count,
         }
     return {
+        "num_agents": graph.num_agents,
+        "graph_edges": [list(edge) for edge in graph.edge_list()],
         "episodes": len(episodes),
         "methods": method_summary,
         "retrieval_coverage": _retrieval_coverage(episodes, stores),

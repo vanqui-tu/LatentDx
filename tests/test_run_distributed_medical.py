@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from scripts.run_distributed_medical import _build_graph, _load_graph_from_file
+from scripts.run_distributed_medical import _build_graph, _load_graph_from_file, _summary
 
 
 def _graph_args(*, num_agents=5, topology="ring", topology_file=None, seed=42, num_shortcuts=1):
@@ -42,3 +42,12 @@ def test_topology_file_rejects_incompatible_agent_count_and_duplicate_edges(tmp_
         _load_graph_from_file(summary, 5)
     with pytest.raises(ValueError, match="does not match"):
         _load_graph_from_file(summary, 10)
+
+
+def test_summary_records_graph_for_a_follow_up_baseline():
+    graph = _build_graph(_graph_args(topology="shortcut_ring"))
+
+    summary = _summary([], (), {}, (), graph)
+
+    assert summary["num_agents"] == 5
+    assert summary["graph_edges"] == [[0, 1], [0, 4], [1, 2], [1, 4], [2, 3], [3, 4]]
