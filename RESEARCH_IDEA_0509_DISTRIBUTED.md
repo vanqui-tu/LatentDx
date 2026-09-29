@@ -688,6 +688,10 @@ agent, but the **training computation graph must be the same graph used at
 inference**. The Qwen backbone is frozen. There is no parameter server, central
 gradient aggregation, learned routing, or learned stopping.
 
+**Current issue:** the detached-edge local/relay proxy losses do not directly
+optimize the two-relay end-to-end source loss; training currently fluctuates,
+with relay interfaces weakest, even when gossip reaches parameter consensus.
+
 #### 13.1 Canonical two-hop episode
 
 Every M4 episode has one source `s` and exactly two node-disjoint branches:
@@ -1059,6 +1063,10 @@ canonical result existed. Do not complete those tasks under their old scope.
   artifacts saved; `DecentralizedMAS`: `python -m pytest -q` passed 33 tests).**
 
 ### 15.5 M4 - Decentralized latent-interface training
+
+**Open training issue:** L4.1/L4.2 currently provide local credit only, while
+`L_src` is detached and diagnostic; investigate the resulting objective mismatch,
+moving child-block targets, and relay instability before treating M4 as converged.
 
 - [x] **L4.1 - Canonical two-hop computation graph and relevance-aware losses.** Replace
   the current source-rooted training route with the single canonical return
